@@ -483,7 +483,11 @@ export function minimalEnv(
 // compromises hub still can't smuggle a bad spec past the daemon.
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const MODEL_RE = /^[a-zA-Z0-9._:\-]+$/;
+// 与 server/src/create-node-validate.ts 同镜像:允许恰好一个 `/` 分隔的 provider/model(OpenCode 共存,
+// 桌面向导 0.2.61 起发 `opencode/mimo-v2.5-free`),每段仍是原字符集且不能是纯点段。
+const MODEL_SEGMENT = "[a-zA-Z0-9._:\\-]+";
+const MODEL_RE = new RegExp(`^${MODEL_SEGMENT}(?:/${MODEL_SEGMENT})?$`);
+const MODEL_DOT_ONLY_SEGMENT = /(^|\/)\.+(\/|$)/;
 // #1298 — 必须与 agent-network/src/normalize-runtime.ts 的 SUPPORTED_RUNTIME_NAMES
 // 逐字一致。两个包之间没有依赖关系（agent-node 不 import agent-network），所以这里
 // 只能是一份副本；而副本靠纪律会漂 —— 本仓 im/access-resolve.ts 那对镜像就没有门。
@@ -558,7 +562,7 @@ export function buildAnetArgsDaemon(spec: DaemonNodeSpec): string[] {
   if (!spec.name || !NAME_RE.test(spec.name)) throw new Error("node_name_invalid");
   if (!VALID_RUNTIMES.has(spec.runtime)) throw new Error("runtime_invalid");
   if (spec.model !== undefined && spec.model !== null &&
-      (spec.model.length === 0 || spec.model.length > 100 || !MODEL_RE.test(spec.model))) throw new Error("model_invalid");
+      (spec.model.length === 0 || spec.model.length > 100 || !MODEL_RE.test(spec.model) || MODEL_DOT_ONLY_SEGMENT.test(spec.model))) throw new Error("model_invalid");
   if (Array.isArray(spec.channels) && spec.channels.length > 0) throw new Error("channels_not_supported_in_p1");
   const args: string[] = ["node", "create", spec.name, "--runtime", spec.runtime];
   if (spec.model) args.push("--model", spec.model);
