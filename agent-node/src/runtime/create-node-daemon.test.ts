@@ -168,6 +168,13 @@ describe("buildAnetArgsDaemon now reaches flag value validation", () => {
       name: "x", runtime: "claude-agent-sdk", model: "",
     })).toThrow(/model_invalid/);
   });
+  test("provider/model (OpenCode co-presence) passes; two slashes, edge slashes and dot-only segments are rejected", () => {
+    const args = buildAnetArgsDaemon({ name: "x", runtime: "opencode-cli", model: "opencode/mimo-v2.5-free" });
+    expect(args).toContain("opencode/mimo-v2.5-free");
+    for (const bad of ["a/b/c", "/model", "provider/", "../x", "x/.", "open code/m"]) {
+      expect(() => buildAnetArgsDaemon({ name: "x", runtime: "opencode-cli", model: bad })).toThrow(/model_invalid/);
+    }
+  });
   test("smuggled string maxTurns rejected by daemon even if hub missed", () => {
     expect(() => buildAnetArgsDaemon({
       name: "x", runtime: "claude-agent-sdk", model: "x",

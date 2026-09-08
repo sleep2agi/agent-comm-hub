@@ -35,6 +35,15 @@ describe("validateRuntime / validateModel (§4.2.2)", () => {
     expect(() => validateModel("gpt-4o")).not.toThrow();
     expect(() => validateModel("bad model")).toThrow(ValidationError);
     expect(() => validateModel("x;rm")).toThrow(ValidationError);
+    // provider/model(OpenCode 共存;桌面向导 0.2.61 起发这种形状,Vincent 2026-09-08 撞到 model_invalid)
+    expect(() => validateModel("opencode/mimo-v2.5-free")).not.toThrow();
+    expect(() => validateModel("anthropic/claude-sonnet-4")).not.toThrow();
+    expect(() => validateModel("a/b/c")).toThrow(ValidationError);      // 只许一个斜杠
+    expect(() => validateModel("/model")).toThrow(ValidationError);     // 不能以斜杠开头
+    expect(() => validateModel("provider/")).toThrow(ValidationError);  // 不能以斜杠结尾
+    expect(() => validateModel("../x")).toThrow(ValidationError);       // 纯点段(路径穿越形状)
+    expect(() => validateModel("x/.")).toThrow(ValidationError);
+    expect(() => validateModel("open code/m")).toThrow(ValidationError);
     expect(() => validateModel("")).toThrow(ValidationError);
   });
 });

@@ -58,7 +58,11 @@ const ENV_KEY_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 // §4.2.2 name + model.
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const MODEL_RE = /^[a-zA-Z0-9._:\-]+$/;
+// OpenCode 共存的模型带 provider 前缀(`opencode/mimo-v2.5-free`,agent-node parseModelRef 按第一个 `/` 切),
+// 桌面向导 0.2.61 起就发这种形状 —— 允许**恰好一个**斜杠分隔的两段;每段仍是原字符集,且不能是纯点(`..`/`.`)。
+const MODEL_SEGMENT = "[a-zA-Z0-9._:\\-]+";
+const MODEL_RE = new RegExp(`^${MODEL_SEGMENT}(?:/${MODEL_SEGMENT})?$`);
+const MODEL_DOT_ONLY_SEGMENT = /(^|\/)\.+(\/|$)/;
 
 export function validateName(s: unknown): asserts s is string {
   if (typeof s !== "string" || !NAME_RE.test(s)) {
@@ -90,7 +94,7 @@ export function validateRuntime(s: unknown): asserts s is Runtime {
 
 export function validateModel(s: unknown): asserts s is string | undefined | null {
   if (s === undefined || s === null) return;
-  if (typeof s !== "string" || s.length === 0 || s.length > 100 || !MODEL_RE.test(s)) {
+  if (typeof s !== "string" || s.length === 0 || s.length > 100 || !MODEL_RE.test(s) || MODEL_DOT_ONLY_SEGMENT.test(s)) {
     throw new ValidationError("model_invalid", { value: typeof s === "string" ? s.slice(0, 80) : typeof s });
   }
 }
