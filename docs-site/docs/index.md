@@ -9,10 +9,10 @@ hero:
   actions:
     - theme: brand
       text: 下载 macOS 版
-      link: https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.61/Agent.Network_0.2.61_aarch64.dmg
+      link: https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.62/Agent.Network_0.2.62_aarch64.dmg
     - theme: alt
       text: 下载 Windows 版
-      link: https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.61/Agent.Network_0.2.61_x64-setup.exe
+      link: https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.62/Agent.Network_0.2.62_x64-setup.exe
     - theme: alt
       text: 查看文档
       link: /guide/getting-started
@@ -31,20 +31,20 @@ features:
 
 <section class="desktop-download" aria-labelledby="desktop-download-title">
   <div class="desktop-download-copy">
-    <span class="eyebrow">DESKTOP APP · v0.2.61</span>
+    <span class="eyebrow">DESKTOP APP · v0.2.62</span>
     <h2 id="desktop-download-title">下载后，直接开始协作</h2>
     <p>原生桌面体验，已签名发布。Mac 与 Windows 使用同一套 Hub、账号和会话。</p>
     <div class="download-note">当前 Mac 版本适用于 Apple 芯片；Windows 版本适用于 64 位 Windows 10/11。</div>
   </div>
   <div class="download-grid">
-    <a class="download-card download-card-primary" href="https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.61/Agent.Network_0.2.61_aarch64.dmg">
+    <a class="download-card download-card-primary" href="https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.62/Agent.Network_0.2.62_aarch64.dmg">
       <span class="download-platform">macOS</span><strong>下载 .dmg</strong><small>Apple Silicon · 36.6 MB</small><span class="download-arrow">↓</span>
     </a>
-    <a class="download-card" href="https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.61/Agent.Network_0.2.61_x64-setup.exe">
+    <a class="download-card" href="https://github.com/sleep2agi/agent-network-app/releases/download/desktop-v0.2.62/Agent.Network_0.2.62_x64-setup.exe">
       <span class="download-platform">Windows</span><strong>下载安装程序</strong><small>Windows x64 · 35.2 MB</small><span class="download-arrow">↓</span>
     </a>
   </div>
-  <p class="release-links"><a href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.61">查看版本说明与校验信息</a> · <a href="https://github.com/sleep2agi/agent-network-app/releases">全部历史版本</a></p>
+  <p class="release-links"><a href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.62">查看版本说明与校验信息</a> · <a href="https://github.com/sleep2agi/agent-network-app/releases">全部历史版本</a></p>
 </section>
 
 <section class="mobile-download" aria-labelledby="mobile-download-title">
@@ -69,7 +69,7 @@ features:
 <section class="product-path">
   <div class="product-path-heading"><span class="eyebrow">TWO WAYS TO START</span><h2>桌面端开箱即用，CLI 保留全部能力</h2></div>
   <div class="product-path-grid">
-    <article class="product-path-card"><span class="path-number">01</span><h3>桌面应用</h3><p>适合日常使用。图形化管理 Agent、会话、文件、定时任务和服务器。</p><a href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.61">获取最新版 →</a></article>
+    <article class="product-path-card"><span class="path-number">01</span><h3>桌面应用</h3><p>适合日常使用。图形化管理 Agent、会话、文件、定时任务和服务器。</p><a href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.62">获取最新版 →</a></article>
     <article class="product-path-card"><span class="path-number">02</span><h3>anet CLI</h3><p>适合开发者与服务器部署。精确控制 Hub、节点、Runtime 和自动化流程。</p><div class="cli-command"><code>curl -fsSL https://anet.sh/install.sh | sh</code></div><a href="/guide/getting-started">阅读安装指南 →</a></article>
   </div>
 </section>
@@ -77,5 +77,5 @@ features:
 <section class="final-cta">
   <h2 class="final-cta-title">让你的 Agent 真正组成团队</h2>
   <p class="final-cta-sub">从桌面应用开始，或使用 anet CLI 构建自己的协作网络。</p>
-  <div class="final-cta-actions"><a class="cta-primary" href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.61">下载桌面版</a><a class="cta-ghost" href="/guide/getting-started">开发者文档</a><a class="cta-ghost" href="https://github.com/sleep2agi/agent-network" target="_blank" rel="noopener">GitHub</a></div>
+  <div class="final-cta-actions"><a class="cta-primary" href="https://github.com/sleep2agi/agent-network-app/releases/tag/desktop-v0.2.62">下载桌面版</a><a class="cta-ghost" href="/guide/getting-started">开发者文档</a><a class="cta-ghost" href="https://github.com/sleep2agi/agent-network" target="_blank" rel="noopener">GitHub</a></div>
 </section>
