@@ -155,7 +155,7 @@ anet node codex resume  <alias> --thread <36 位 thread id> --probe-from <peer>
 
 `restart` 的每一步顺序固定、不做推理:**preflight(before)** 任一项 fail 就不碰进程 → 读 **goal 状态**(读不到或 schema 不认识 = 不明,直接 STOP)→ 按依赖反向 **停 Bridge → TUI → App Server**(先断任务入口,再让 TUI 把 rollout 刷完,最后放掉端口)→ 等 rollout 字节数稳定(大会话慢刷盘)→ 等端口空闲(占用者若核实是本节点残留的 app-server 才定向 TERM,外来进程一律 FAIL 不动)→ 交给启动器 `anet node start --copresence --tui-first`(**App Server → 端口就绪 → exact-session TUI 完全恢复 → Bridge**;bridge 晚于 TUI,任务不会落到人看不见的会话上)→ **verify(after)**:preflight 全项 + 子进程环境 + rollout 前后比对(同一文件、字节只增不减)+ goal 文件未变 + hub 回到在线 + 跨节点 nonce 验收。启动失败自动回滚一次(按原配置再起);再失败就停在已停状态,receipt 记到哪一步。
 
-`--probe-from <peer>` 用另一个本地节点通过 hub 给目标发一条带随机 nonce 的任务,等目标回复经 hub 落到 peer 的收件箱,且 hub 标注的发送者正是目标 alias,`identity_attested` 才算 pass;不给 peer 时该项 unknown,整体 **FAIL**(有意:不许「大概是它」)。`resume --thread` 只接受完整 36 位 id 且该 id 在本节点 CODEX_HOME 下恰有一个 rollout,才写进 config;不接受前缀,不猜「最近一个」。
+`--probe-from <peer>`(peer 住在别的 `.anet` 根时加 `--probe-root <dir>`)用另一个本地节点通过 hub 给目标发一条带随机 nonce 的任务,等目标回复经 hub 落到 peer 的收件箱,且 hub 标注的发送者正是目标 alias,`identity_attested` 才算 pass;不给 peer 时该项 unknown,整体 **FAIL**(有意:不许「大概是它」)。`resume --thread` 只接受完整 36 位 id 且该 id 在本节点 CODEX_HOME 下恰有一个 rollout,才写进 config;不接受前缀,不猜「最近一个」。
 
 `--json` 输出整份 receipt(含 `stoppedAt` / `rolledBack`),供 Dashboard「体检」按钮消费。
 
@@ -169,6 +169,22 @@ cd <dir> && anet node codex start <target> --probe-from <source>      # 首次�
 fork 只读源节点(它的 auth.json / config.toml 和**那一个** rollout),在 `<dir>/.anet/nodes/<target>/` 造一个全新节点:新 `node_id` 与 CommHub 身份、新 `CODEX_HOME`(0700,auth.json 0600)、新 thread id(UUIDv7)、新工作目录、新 tmux 名;端口在首次启动时分配。rollout 是**流式复制并逐处改写 thread id**(定长 36 字符,字节数不变),不是共享同一文件;第一行必须是源 thread 的 `session_meta`,否则一个字节都不写。源节点的 `.anet-copresence.env`(含它的 CommHub token)、history、sqlite、缓存一律不带;完整访问也不继承,除非显式 `--inherit-full-access` 且源节点本来就开着。
 
 receipt 的 `fork_isolation` 要求身份 / HOME / thread / rollout 文件 / tmux 名五处都不同、rollout 等长复制且目标 HOME 里没有 token 文件;`identity_attested` 在 fork 阶段为 unknown(不阻塞),由首次 `start --probe-from` 闭环。`start` / `restart` / `resume` 必须在 `config.codexProjectDir` 记的目录里执行,否则拒绝(三段 tmux 的工作目录与 `.anet/nodes` 都是相对当前目录的)。
+
+### 账号迁移:`account install` 与 `rollback`
+
+```bash
+CODEX_HOME=/some/home codex login                                   # 人先在任意 HOME 登录一次(ChatGPT)
+anet node codex account register team-a --from-codex-home /some/home  # 登记进本机受控 registry(host-bound)
+anet node codex account list
+anet node codex account install <alias> --source codex-login:team-a --probe-from <peer>
+anet node codex rollback <alias> --receipt <install-receipt-id> --probe-from <peer>
+```
+
+登录源只接受 **不透明引用** `codex-login:<profile-id>`:CLI 不收路径、stdin、环境变量。profile 由本机 `~/.anet/codex-login/registry.json`(0600)解析,凭据正文存 `profiles/<id>/auth.json`(0600),条目绑定 `host_id`(machine-id + 主机名的摘要),拷到别的机器不认;PR-D 只认 ChatGPT 登录(`auth_mode=chatgpt`)。receipt、registry、日志里只出现 `profile_id` 与不可逆的 `account_fingerprint`(sha256(account_id) 前 16 位)以及 `backup_ref`,不出现 token、auth 内容或真实路径。
+
+`install` 是确定性状态机:目标 preflight(fail 即停)→ 在隔离的临时 HOME 里用该 profile 发一次 **fresh 模型请求**(`codex exec`,固定回句;401 / 凭据失效 → auth,配额 / 429 → quota,模型不兼容 → model,归不了类 → unknown,四种都 STOP 且目标一字未动,探针结果回写 registry)→ 备份目标 auth.json 到 `receipt:<id>`(0600)→ 0600 原子安装 → **完整重启**(PR-B 状态机,含 verify + nonce 验收)→ 目标指纹必须等于源指纹。安装后任一步失败 → 自动恢复备份并再重启一次,receipt 记录两段。
+
+`rollback` 只接受原 install receipt 里的 `backup_ref`,不接受调用方另传文件:恢复 → 完整重启 → 指纹回到 receipt 记的 `targetPreviousFingerprint`。
 
 `preflight` 核的项(每项 pass / fail / unknown,**任一非 pass 整体 FAIL**,不许部分成功):alias 与 hub 名册里的 `node_id` 精确匹配;节点自己的 `CODEX_HOME` 0700、`auth.json` 0600、CommHub token 指纹一致;工作目录在 config、TUI 进程 cwd、TUI `-C`、Bridge 进程四处一致;`codexThreadId` 是完整 36 位且 `CODEX_HOME` 里恰有一个对应 rollout(记下绝对路径、inode、字节数、mtime;不接受前缀或「最近的文件」);app-server 端口的占用者确实是本节点的进程(否则视为 foreign PID,不会去动它);tmux 三段(app-server / TUI / bridge)都在跑且子进程都带本节点的身份 marker。
 

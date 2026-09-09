@@ -135,7 +135,8 @@ export function compareRollout(before: RolloutFact, after: RolloutFact | null): 
 // ⑦ 端口占用归属:只有确定属于目标实例(cwd / argv / CODEX_HOME 都对得上)才算;否则是 foreign PID。
 export function checkPortOwner(f: PreflightFacts): ReceiptCheck {
   const p = f.port;
-  if (p.port === null) return { key: "port_owner_verified", status: "fail", detail: "config.codexAppServerUrl has no port" };
+  // 从没起过的节点(fork 刚造出来)还没有 app-server URL:端口由启动器分配。这是 unknown 不是 fail —— before 阶段放行,verify 阶段照样拦。
+  if (p.port === null) return { key: "port_owner_verified", status: "unknown", detail: "config.codexAppServerUrl has no port yet (never started; the launcher allocates one)" };
   if (!p.owner) return { key: "port_owner_verified", status: "pass", detail: `port ${p.port} is free`, evidence: { port: p.port, state: "free" } };
   const o = p.owner;
   const looksLikeAppServer = o.argv.some((a) => /app-server/.test(a));

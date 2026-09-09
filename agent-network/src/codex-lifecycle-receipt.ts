@@ -48,8 +48,9 @@ export const REQUIRED_CHECKS: Readonly<Record<LifecycleVerb, readonly string[]>>
   resume: ["identity_match", "home_isolated", "workdir_consistent", "session_exact", "rollout_intact", "start_order", "child_env_attested", "identity_attested"],
   // fork 只创建不启动:identity_attested 留给首次 start(--probe-from);目标侧要求 exact thread + 唯一 rollout。
   fork: ["identity_match", "fork_isolation", "home_isolated", "workdir_consistent", "session_exact"],
-  "account-install": ["identity_match", "account_probe", "home_isolated", "identity_attested"],
-  rollback: ["identity_match", "rollout_intact"],
+  // account-install 内含一次完整 restart(after 阶段的 check 原样并入),外加探针/安装/验证三项;identity_attested 仍由 --probe-from 闭环。
+  "account-install": ["identity_match", "home_isolated", "session_exact", "account_probe", "account_installed", "account_verified", "start_order", "identity_attested"],
+  rollback: ["identity_match", "home_isolated", "session_exact", "rollback_restore", "account_verified", "start_order"],
 };
 
 export function shortFingerprint(value: string | undefined | null, length = 12): string | null {
@@ -69,7 +70,7 @@ export function redactReceipt<T>(value: T, key = ""): T {
   return value;
 }
 
-export const INFORMATIONAL_PREFIXES: readonly string[] = ["before:", "source:"];
+export const INFORMATIONAL_PREFIXES: readonly string[] = ["before:", "source:", "restart:", "rollback:"];
 
 export function receiptVerdict(verb: LifecycleVerb, checks: readonly ReceiptCheck[]): { verdict: "PASS" | "FAIL"; blocking: string[] } {
   const byKey = new Map(checks.map((c) => [c.key, c]));
