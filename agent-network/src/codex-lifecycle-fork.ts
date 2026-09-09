@@ -47,21 +47,29 @@ export interface RolloutRewriteResult {
   readonly lines: number;
   readonly bytesIn: number;
   readonly bytesOut: number;
+  /** 源 thread id 改写次数(定长,不改字节数)。 */
   readonly replacements: number;
+  /** `"cwd":"<源目录>"` 改写次数(session_meta + 每个 turn_context 都带;改成新 workdir,字节数按长度差变化)。 */
+  readonly cwdReplacements: number;
+  /** = bytesIn + cwdReplacements × (新 cwd 编码长度 − 旧 cwd 编码长度);fork_isolation 用它核对复制没有丢字节。 */
+  readonly expectedBytesOut: number;
 }
 
 /**
  * 流式复制 rollout 并把源 thread id 逐处改成新 id(两者定长 36 字符 → 字节数不变,可作 fork_isolation 的证据)。
  * 第一行校验失败时目标文件不存在(先读第一行再开写)。
  */
-export async function rewriteRollout(src: string, dst: string, oldId: string, newId: string): Promise<RolloutRewriteResult> {
+export async function rewriteRollout(src: string, dst: string, oldId: string, newId: string, cwd?: { from: string; to: string }): Promise<RolloutRewriteResult> {
   if (!THREAD_ID_RE.test(oldId) || !THREAD_ID_RE.test(newId)) throw new Error("rewriteRollout: thread ids must be 36-char uuids");
   if (oldId.toLowerCase() === newId.toLowerCase()) throw new Error("rewriteRollout: new id equals source id");
   if (existsSync(dst)) throw new Error(`rewriteRollout: target already exists: ${dst}`);
   const bytesIn = statSync(src).size;
   const rl = createInterface({ input: createReadStream(src, { encoding: "utf8" }), crlfDelay: Infinity });
   let out: ReturnType<typeof createWriteStream> | null = null;
-  let lines = 0, replacements = 0, bytesOut = 0;
+  let lines = 0, replacements = 0, cwdReplacements = 0, bytesOut = 0;
+  // 精确匹配 JSON 里的 "cwd":"<from>"(含引号与转义),只换目录字面量,不碰别的字段。
+  const cwdFrom = cwd ? `"cwd":${JSON.stringify(cwd.from)}` : null;
+  const cwdTo = cwd ? `"cwd":${JSON.stringify(cwd.to)}` : null;
   const write = (s: string) => new Promise<void>((res, rej) => { out!.write(s, (e) => (e ? rej(e) : res())); });
   try {
     for await (const line of rl) {
@@ -76,7 +84,13 @@ export async function rewriteRollout(src: string, dst: string, oldId: string, ne
       }
       const parts = line.split(oldId);
       replacements += parts.length - 1;
-      const rewritten = parts.join(newId) + "\n";
+      let body = parts.join(newId);
+      if (cwdFrom && cwdTo && cwdFrom !== cwdTo) {
+        const cparts = body.split(cwdFrom);
+        cwdReplacements += cparts.length - 1;
+        body = cparts.join(cwdTo);
+      }
+      const rewritten = body + "\n";
       bytesOut += Buffer.byteLength(rewritten);
       await write(rewritten);
       lines += 1;
@@ -85,7 +99,8 @@ export async function rewriteRollout(src: string, dst: string, oldId: string, ne
     if (out) await new Promise<void>((res) => out!.end(res));
   }
   if (lines === 0) throw new Error("rewriteRollout: source rollout is empty — refusing");
-  return { lines, bytesIn, bytesOut, replacements };
+  const delta = cwdFrom && cwdTo && cwdFrom !== cwdTo ? Buffer.byteLength(cwdTo) - Buffer.byteLength(cwdFrom) : 0;
+  return { lines, bytesIn, bytesOut, replacements, cwdReplacements, expectedBytesOut: bytesIn + cwdReplacements * delta };
 }
 
 export interface ForkSides {
@@ -104,7 +119,7 @@ export function checkForkIsolation(s: ForkSides): ReceiptCheck {
   if (s.target.rolloutInode === null || s.target.rolloutInode === s.source.rolloutInode) bad.push("rollout not a separate file");
   if (s.rewrite === null) bad.push("rollout was not rewritten");
   else {
-    if (s.rewrite.bytesIn !== s.rewrite.bytesOut) bad.push(`rollout size changed ${s.rewrite.bytesIn}→${s.rewrite.bytesOut}`);
+    if (s.rewrite.expectedBytesOut !== s.rewrite.bytesOut) bad.push(`rollout size ${s.rewrite.bytesOut} ≠ expected ${s.rewrite.expectedBytesOut} (in ${s.rewrite.bytesIn}, ${s.rewrite.cwdReplacements} cwd rewrites)`);
     if (s.rewrite.replacements < 1) bad.push("source thread id never appeared in rollout");
     if (s.target.rolloutBytes !== null && s.target.rolloutBytes !== s.rewrite.bytesOut) bad.push("written rollout size differs from stream count");
   }
@@ -112,8 +127,8 @@ export function checkForkIsolation(s: ForkSides): ReceiptCheck {
   const evidence = {
     sourceNodeId: s.source.nodeId, targetNodeId: s.target.nodeId,
     sourceThread: s.source.threadId, targetThread: s.target.threadId,
-    rolloutLines: s.rewrite?.lines ?? null, rolloutBytes: s.rewrite?.bytesOut ?? null, idReplacements: s.rewrite?.replacements ?? null,
+    rolloutLines: s.rewrite?.lines ?? null, rolloutBytes: s.rewrite?.bytesOut ?? null, idReplacements: s.rewrite?.replacements ?? null, cwdReplacements: s.rewrite?.cwdReplacements ?? null,
   };
   if (bad.length > 0) return { key: "fork_isolation", status: "fail", detail: bad.join("; "), evidence };
-  return { key: "fork_isolation", status: "pass", detail: `new node_id / CODEX_HOME / thread / rollout file / tmux names; rollout ${s.rewrite!.lines} lines copied byte-for-byte with ${s.rewrite!.replacements} id rewrites`, evidence };
+  return { key: "fork_isolation", status: "pass", detail: `new node_id / CODEX_HOME / thread / rollout file / tmux names; rollout ${s.rewrite!.lines} lines copied with ${s.rewrite!.replacements} id rewrites and ${s.rewrite!.cwdReplacements} cwd rewrites (byte count as expected)`, evidence };
 }

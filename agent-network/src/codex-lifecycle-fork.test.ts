@@ -31,6 +31,18 @@ describe("#1856 PR-C fork: rollout rewrite", () => {
     expect(JSON.parse(out.split("\n")[0]).payload.session_id).toBe(NEW);
   });
 
+  test("relocates the recorded cwd in every line and accounts for the byte delta", async () => {
+    const { dir, src } = fixture([meta(SRC), `{"type":"turn_context","payload":{"cwd":"/w","x":"${SRC}"}}`, `{"type":"msg","payload":{"cwdish":"/w/not-a-cwd-field"}}`]);
+    const dst = join(dir, "out.jsonl");
+    const r = await rewriteRollout(src, dst, SRC, NEW, { from: "/w", to: "/new/workdir" });
+    expect(r.cwdReplacements).toBe(2); // session_meta + turn_context; the look-alike field is untouched
+    expect(r.expectedBytesOut).toBe(r.bytesIn + 2 * ("/new/workdir".length - "/w".length));
+    expect(r.bytesOut).toBe(r.expectedBytesOut);
+    const out = readFileSync(dst, "utf8");
+    expect(JSON.parse(out.split("\n")[0]).payload.cwd).toBe("/new/workdir");
+    expect(out).toContain("/w/not-a-cwd-field");
+  });
+
   test("first line not session_meta for the source id → refuses before writing anything", async () => {
     const { dir, src } = fixture([meta("01a02193-e1fd-70f3-9e16-6fbff295fbaf"), "{}"]);
     const dst = join(dir, "out.jsonl");
@@ -77,7 +89,7 @@ describe("#1856 PR-C fork: fork_isolation", () => {
   const ok = () => ({
     source: { nodeId: "n_a", homeReal: "/a/codex-home", threadId: SRC, alias: "源", rolloutInode: 1, rolloutBytes: 100 },
     target: { nodeId: "n_b", homeReal: "/b/codex-home", threadId: NEW, alias: "叉", rolloutInode: 2, rolloutBytes: 100, envFilePresent: false },
-    rewrite: { lines: 3, bytesIn: 100, bytesOut: 100, replacements: 3 },
+    rewrite: { lines: 3, bytesIn: 100, bytesOut: 100, replacements: 3, cwdReplacements: 0, expectedBytesOut: 100 },
   });
   test("all five distinct + byte-equal rewrite → pass", () => {
     const c = checkForkIsolation(ok());
@@ -91,7 +103,7 @@ describe("#1856 PR-C fork: fork_isolation", () => {
       ["thread id", (s) => { s.target.threadId = SRC; }],
       ["alias", (s) => { s.target.alias = "源"; }],
       ["rollout not a separate", (s) => { s.target.rolloutInode = 1; }],
-      ["size changed", (s) => { s.rewrite.bytesOut = 99; }],
+      ["rollout size", (s) => { s.rewrite.bytesOut = 99; }],
       ["never appeared", (s) => { s.rewrite.replacements = 0; }],
       ["env file", (s) => { s.target.envFilePresent = true; }],
       ["not rewritten", (s) => { s.rewrite = null; }],
@@ -116,5 +128,13 @@ describe("#1856 PR-C fork verdict", () => {
   });
   test("fork does not require identity_attested but does require session_exact on the target", () => {
     expect(receiptVerdict("fork", req.filter((c) => c.key !== "session_exact")).blocking).toEqual(["session_exact"]);
+  });
+});
+
+describe("#1856 PR-D config round-trip", () => {
+  test("codexProjectDir survives serializeProfileForConfigJson (the field whitelist)", async () => {
+    const { serializeProfileForConfigJson } = await import("./profile-serialize.js");
+    const out = serializeProfileForConfigJson({ node_id: "n", runtime: "codex-app-server", codexProjectDir: "/w" } as any, { node_id: "n", runtime: "codex-app-server", codexProjectDir: "/w" } as any);
+    expect((out as any).codexProjectDir).toBe("/w");
   });
 });

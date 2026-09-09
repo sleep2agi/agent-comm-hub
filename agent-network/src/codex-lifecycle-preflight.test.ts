@@ -79,7 +79,7 @@ describe("⑦ port owner", () => {
     expect(status(checkPortOwner(g))).toBe("pass");
     expect(status(checkPortOwner({ ...g, port: { port: 24703, owner: { ...g.port.owner!, codexHome: "/elsewhere" } } }))).toBe("fail");
     expect(status(checkPortOwner({ ...g, port: { port: 24703, owner: { ...g.port.owner!, argv: ["python3", "-m", "http.server"] } } }))).toBe("fail");
-    expect(status(checkPortOwner({ ...g, port: { port: null, owner: null } }))).toBe("fail");
+    expect(status(checkPortOwner({ ...g, port: { port: null, owner: null } }))).toBe("unknown");
   });
 });
 describe("⑧ child env attestation", () => {

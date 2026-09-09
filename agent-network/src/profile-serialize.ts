@@ -54,6 +54,10 @@ export function serializeProfileForConfigJson(
     ...((normalized.codexThreadId ?? profile.codexThreadId)
       ? { codexThreadId: normalized.codexThreadId ?? profile.codexThreadId }
       : {}),
+    // #1856 PR-C/D — 共存节点工作目录;fork --workdir 写入,lifecycle 命令在此目录里才肯动作。漏在这张白名单里 = 一存就丢。
+    ...((normalized.codexProjectDir ?? profile.codexProjectDir)
+      ? { codexProjectDir: normalized.codexProjectDir ?? profile.codexProjectDir }
+      : {}),
     ...((normalized.opencodeMode ?? profile.opencodeMode)
       ? { opencodeMode: normalized.opencodeMode ?? profile.opencodeMode }
       : {}),

@@ -10,10 +10,10 @@
  * anet run                     独立 SSE Agent
  */
 
-import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, lstatSync, renameSync, rmSync, cpSync, copyFileSync, unlinkSync, realpathSync, symlinkSync } from "fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, statSync, lstatSync, renameSync, rmSync, cpSync, copyFileSync, unlinkSync, realpathSync, symlinkSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { fileURLToPath } from "url";
-import { homedir, tmpdir } from "os";
+import { homedir, hostname, tmpdir } from "os";
 import { spawn, spawnSync, execSync, execFileSync } from "child_process";
 import { createHash, randomBytes, randomUUID } from "crypto";
 import {
@@ -38,6 +38,7 @@ import {
 import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb, type ReceiptCheck } from "../src/codex-lifecycle-receipt";
 import { evaluateCodexPreflight, evaluateCodexVerify, checkIdentity, checkHome, checkSession } from "../src/codex-lifecycle-preflight";
 import { FORK_HOME_COPY, checkForkIsolation, forkRolloutPath, rewriteRollout, uuidV7 } from "../src/codex-lifecycle-fork";
+import { accountFingerprint, backupPathFor, backupRefFor, classifyProbe, credentialRefFor, hostIdOf, parseSourceRef, readRegistry, resolveProfile, runAccountInstall, runRollback, writeRegistry, type ProbeStatus, type RegistryEntry } from "../src/codex-lifecycle-account";
 import { gatherCodexFacts, realPrimitives, findRollouts, processFact, goalsFileState } from "../src/codex-lifecycle-facts";
 import { runCodexRestart, type RestartActions, type GoalState as LifecycleGoalState } from "../src/codex-lifecycle-restart";
 import { alreadyRunningMessage, runningNodePid } from "../src/node-running-guard";
@@ -1573,10 +1574,13 @@ async function startCopresenceOrchestration(nodeId: string, opts: CopresenceOpti
     // path reads codexAppServerUrl / codexThreadId from the config we just
     // wrote and spawns agent-node in adopt mode. Same launchAgent()
     // codepath as the non-copresence case — no fork of the bridge dispatch.
+    // #1856 PR-D — 桥再入用**当前这份 anet**(execPath + execArgv + argv[1]),不用 PATH 上的 `anet`:
+    // 真机上 PATH 里是另一个版本,它不认这份 profile,把桥当成 claude-code-cli 起了;沿用 PATH 等于让桥的运行时取决于环境。
+    const selfInvoke = [process.execPath, ...process.execArgv, process.argv[1]].map(shellQuote).join(" ");
     const bridgeCmd = [
       `export CODEX_HOME=${shellQuote(opts.codexHome)}`,
       `unset COMMHUB_TOKEN ANET_CODEX_COMMHUB_TOKEN`,
-      `exec anet node start ${shellQuote(displayName)}`,
+      `exec ${selfInvoke} node start ${shellQuote(displayName)}`,
     ].join(" && ");
     try {
       execFileSync("tmux", [
@@ -3896,7 +3900,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
-  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume|fork (#1856)
+  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume|fork|account|rollback
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -7446,31 +7450,32 @@ async function startCommand() {
 // ── #1856 —— anet node codex <verb> <alias>:Codex TUI 共存节点生命周期控制器 ──
 // PR-A:preflight / verify(只读,不碰进程、不改文件;只在 <nodeDir>/receipts/ 写 receipt)。
 // start / restart / resume / fork / account / rollback 分 PR 落地;合同与 14 条不变量见 issue #1856。
-async function codexLifecycleCommand() {
-  const verb = args[1] as LifecycleVerb | undefined;
-  const ref = args[2];
-  const opts = parseOpts();
-  const usage = () => {
-    console.error("Usage: anet node codex <preflight|verify|start|restart|resume|fork> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
-    console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
-    console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
-    console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
-    console.error("  restart    确定性状态机(零 LLM):preflight → goal 状态 → 停 Bridge→TUI→App Server → 端口放掉 → 起(App Server→端口→exact TUI→Bridge)→ verify");
-    console.error("             --probe-from <peer>  用另一本地节点发 nonce 探针做跨节点身份验收(identity_attested;不给则 unknown → FAIL)");
-    console.error("  start      同 restart 但要求三段都不在;resume --thread <id> 先把 exact thread 写进 config(要求唯一 rollout)再 start");
-    console.error("  fork       fork <source> --name <target> --workdir <dir> [--inherit-full-access]:继承历史,其余全新(node_id/CODEX_HOME/thread/端口/tmux 名);");
-    console.error("             rollout 复制并改写 id,源节点零触碰;之后在 <dir> 里 anet node codex start <target> --probe-from <source>");
-    console.error("  account / rollback:见 #1856,PR-D..E");
-  };
-  const landed = ["preflight", "verify", "start", "restart", "resume", "fork"];
-  if (!verb || !ref || !landed.includes(verb)) {
-    if (verb && ["account", "rollback"].includes(verb)) {
-      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-D..E).`);
-      process.exit(2);
-    }
-    usage(); process.exit(verb ? 2 : 0);
-  }
-  if (verb === "fork") { await codexForkCommand(ref, opts); return; }
+/** #1856 —— --probe-from 的 peer 可能住在另一个 .anet 根(fork 出的节点在自己的 workdir 里);--probe-root <dir> 指定去哪找。 */
+function resolveNodeRefAt(root: string | undefined, ref: string): { id: string; profile: Profile } | null {
+  if (!root) return resolveNodeRef(ref);
+  const back = process.cwd();
+  try { process.chdir(root); return resolveNodeRef(ref); } catch { return null; } finally { process.chdir(back); }
+}
+
+/** #1856 PR-D —— 受控启动前把 codex 的更新提示按「Skip until next version」记进 version.json(固定规则,不敲键盘,不碰二进制)。
+ *  真机:首次启动后 TUI 自己刷新了 version.json(latest 0.153.4 ≠ 装的 0.149.1),重启时 TUI 停在更新提示上,启动器 fail-closed。 */
+function dismissCodexUpdatePrompt(codexHome: string, say: (m: string) => void): void {
+  const p = join(codexHome, "version.json");
+  if (!existsSync(p)) return;
+  try {
+    const v = JSON.parse(readFileSync(p, "utf-8"));
+    const latest = typeof v?.latest_version === "string" ? v.latest_version : null;
+    if (!latest || v?.dismissed_version === latest) return;
+    const tmp = `${p}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({ ...v, dismissed_version: latest }) + "\n", { mode: 0o644 });
+    renameSync(tmp, p);
+    say(`codex update prompt for ${latest} dismissed for this node (version.json dismissed_version; binary untouched)`);
+  } catch (e: any) { say(`could not read/write version.json (${e?.message ?? e}); the TUI may stop on the update prompt`); }
+}
+
+// ── #1856 —— lifecycle 命令共用的上下文(解析节点、cwd 守卫、事实采集器);start/restart/resume/account 都从这里起 ──
+type CodexLifecycleCtx = Awaited<ReturnType<typeof codexLifecycleCtx>>;
+async function codexLifecycleCtx(verb: string, ref: string, opts: Record<string, string>) {
   const resolved = resolveNodeRef(ref);
   if (!resolved) { console.error(`[anet] node codex ${verb}: unknown node "${ref}" (anet node ls)`); process.exit(2); }
   const profile = resolved.profile as Record<string, any>;
@@ -7520,35 +7525,13 @@ async function codexLifecycleCommand() {
     });
   };
   const unattested = { key: "identity_attested", status: "unknown" as const, detail: "cross-node nonce probe not run — pass --probe-from <peer> (restart/start/resume) for attestation" };
-  if (verb === "preflight" || verb === "verify") {
-    const facts = await gather();
-    const checks = verb === "preflight" ? evaluateCodexPreflight(facts) : evaluateCodexVerify(facts, unattested);
-    const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks });
-    const path = writeReceipt(nodeDir, receipt);
-    if (opts.json === "true") console.log(JSON.stringify({ ...receipt, receiptPath: path }, null, 2));
-    else { console.log(formatReceiptSummary(receipt)); console.log(`receipt: ${path}`); }
-    process.exit(receipt.verdict === "PASS" ? 0 : 2);
-  }
-
-  // ── start / restart / resume:确定性状态机(src/codex-lifecycle-restart.ts),这里只提供真实动作 ──
   const say = (m: string) => { if (opts.json !== "true") console.log(`[anet] codex ${verb}: ${m}`); };
-  if (verb === "resume") {
-    const thread = String(opts.thread ?? "");
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)) {
-      console.error(`[anet] node codex resume: --thread <36-char thread id> is required (no prefix, no "latest" guessing)`);
-      process.exit(2);
-    }
-    const matches = findRollouts(codexHome, thread);
-    if (matches.length !== 1) {
-      console.error(`[anet] node codex resume: thread ${thread} has ${matches.length} rollout file(s) under this node's CODEX_HOME — need exactly one; refusing`);
-      process.exit(2);
-    }
-    const stored = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
-    if (stored.codexThreadId !== thread) {
-      saveProfile(resolved.id, { ...(stored as any), codexThreadId: thread });
-      say(`config codexThreadId ${stored.codexThreadId ?? "(none)"} → ${thread} (rollout ${matches[0].path})`);
-    }
-  }
+  return { verb, opts, resolved, profile, displayName, nodeDir, recorded, gc, startedAt, hub, codexHome, sessions, prim, gather, unattested, say };
+}
+
+// ── #1856 PR-B —— 状态机的真实动作;account install/rollback(PR-D)复用同一套 ──
+function codexRestartActions(ctx: CodexLifecycleCtx, peer: { id: string; profile: Profile } | null): RestartActions {
+  const { verb, opts, profile, resolved, displayName, nodeDir, codexHome, sessions, prim, hub, gc, gather, unattested, say } = ctx;
   const port = (() => { try { return profile.codexAppServerUrl ? Number(new URL(profile.codexAppServerUrl).port) || null : null; } catch { return null; } })();
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const sessionIdExact = (name: string): string | null => {
@@ -7559,9 +7542,6 @@ async function codexLifecycleCommand() {
     return null;
   };
   const goalState = async (): Promise<{ state: LifecycleGoalState; fingerprint: string | null }> => goalsFileState(nodeDir);
-  const peer = opts["probe-from"] ? resolveNodeRef(String(opts["probe-from"])) : null;
-  if (opts["probe-from"] && !peer) { console.error(`[anet] node codex ${verb}: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
-  if (peer && peer.id === resolved.id) { console.error(`[anet] node codex ${verb}: --probe-from must be a *different* node`); process.exit(2); }
   const actions: RestartActions = {
     gate: async (phase) => {
       const facts = await gather();
@@ -7611,9 +7591,11 @@ async function codexLifecycleCommand() {
     },
     start: async () => {
       const prof = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
-      const argv = [process.argv[1], "node", "start", displayName, "--copresence", "--tui-first"];
+      // execArgv 跟着走:开发态用 tsx 跑 .ts 时子进程也要带 loader;发布态(dist/bin/cli.js)execArgv 为空,行为不变。
+      const argv = [...process.execArgv, process.argv[1], "node", "start", displayName, "--copresence", "--tui-first"];
       if (prof.codexCopresenceFullAccess) argv.push("--dangerously-allow-full-access", "--yes-danger-full-access");
       const env = { ...process.env }; delete env.ANET_COPRESENCE_BRIDGE; delete env.ANET_NODE_MARKER;
+      dismissCodexUpdatePrompt(codexHome, say);
       say(`launching: anet node start ${shellQuote(displayName)} --copresence --tui-first`);
       const r = spawnSync(process.execPath, argv, { env, encoding: "utf-8", timeout: 240_000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 8 * 1024 * 1024 });
       const tail = `${r.stdout ?? ""}\n${r.stderr ?? ""}`.trim().split("\n").slice(-12).join("\n");
@@ -7665,8 +7647,68 @@ async function codexLifecycleCommand() {
       return { ok: false, detail: `no reply carrying the nonce reached ${peerAlias} within 150s`, evidence: { nonce, peer: peerAlias } };
     } : undefined,
   };
+  return actions;
+}
+
+async function codexLifecycleCommand() {
+  const verb = args[1] as string | undefined;
+  const ref = args[2];
+  const opts = parseOpts();
+  const usage = () => {
+    console.error("Usage: anet node codex <preflight|verify|start|restart|resume|fork|account|rollback> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
+    console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
+    console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
+    console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
+    console.error("  restart    确定性状态机(零 LLM):preflight → goal 状态 → 停 Bridge→TUI→App Server → 端口放掉 → 起(App Server→端口→exact TUI→Bridge)→ verify");
+    console.error("             --probe-from <peer> [--probe-root <dir>]  用另一本地节点发 nonce 探针做跨节点身份验收(identity_attested;不给则 unknown → FAIL);peer 在别的 .anet 根时给 --probe-root");
+    console.error("  start      同 restart 但要求三段都不在;resume --thread <id> 先把 exact thread 写进 config(要求唯一 rollout)再 start");
+    console.error("  fork       fork <source> --name <target> --workdir <dir> [--inherit-full-access]:继承历史,其余全新(node_id/CODEX_HOME/thread/端口/tmux 名);");
+    console.error("             rollout 复制并改写 id,源节点零触碰;之后在 <dir> 里 anet node codex start <target> --probe-from <source>");
+    console.error("  account    register <profile-id> --from-codex-home <dir> | list | install <alias> --source codex-login:<profile-id> [--probe-from <peer>]");
+    console.error("             登录源是本机受控 registry 的不透明引用(不收路径/stdin/env);install = fresh 模型探针 → 备份 → 0600 安装 → 完整重启 → verify;失败自动回滚");
+    console.error("  rollback   rollback <alias> --receipt <id> [--probe-from <peer>]:只认原 install receipt 里的 backup_ref");
+  };
+  const landed = ["preflight", "verify", "start", "restart", "resume", "fork", "account", "rollback"];
+  if (!verb || !ref || !landed.includes(verb)) { usage(); process.exit(verb ? 2 : 0); }
+  if (verb === "fork") { await codexForkCommand(ref, opts); return; }
+  if (verb === "account") { await codexAccountCommand(ref, args[3], opts); return; }
+  if (verb === "rollback") { await codexRollbackCommand(ref, opts); return; }
+  const ctx = await codexLifecycleCtx(verb, ref, opts);
+  const { resolved, profile, displayName, nodeDir, startedAt, codexHome, gather, unattested, say } = ctx;
+  if (verb === "preflight" || verb === "verify") {
+    const facts = await gather();
+    const checks = verb === "preflight" ? evaluateCodexPreflight(facts) : evaluateCodexVerify(facts, unattested);
+    const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks });
+    const path = writeReceipt(nodeDir, receipt);
+    if (opts.json === "true") console.log(JSON.stringify({ ...receipt, receiptPath: path }, null, 2));
+    else { console.log(formatReceiptSummary(receipt)); console.log(`receipt: ${path}`); }
+    process.exit(receipt.verdict === "PASS" ? 0 : 2);
+  }
+
+  // ── start / restart / resume:确定性状态机(src/codex-lifecycle-restart.ts),这里只提供真实动作 ──
+  if (verb === "resume") {
+    const thread = String(opts.thread ?? "");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)) {
+      console.error(`[anet] node codex resume: --thread <36-char thread id> is required (no prefix, no "latest" guessing)`);
+      process.exit(2);
+    }
+    const matches = findRollouts(codexHome, thread);
+    if (matches.length !== 1) {
+      console.error(`[anet] node codex resume: thread ${thread} has ${matches.length} rollout file(s) under this node's CODEX_HOME — need exactly one; refusing`);
+      process.exit(2);
+    }
+    const stored = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
+    if (stored.codexThreadId !== thread) {
+      saveProfile(resolved.id, { ...(stored as any), codexThreadId: thread });
+      say(`config codexThreadId ${stored.codexThreadId ?? "(none)"} → ${thread} (rollout ${matches[0].path})`);
+    }
+  }
+  const peer = opts["probe-from"] ? resolveNodeRefAt(opts["probe-root"], String(opts["probe-from"])) : null;
+  if (opts["probe-from"] && !peer) { console.error(`[anet] node codex ${verb}: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
+  if (peer && peer.id === resolved.id) { console.error(`[anet] node codex ${verb}: --probe-from must be a *different* node`); process.exit(2); }
+  const actions = codexRestartActions(ctx, peer);
   const outcome = await runCodexRestart(verb as "start" | "restart" | "resume", actions);
-  const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks: outcome.checks });
+  const receipt = buildReceipt({ verb: verb as LifecycleVerb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks: outcome.checks });
   const path = writeReceipt(nodeDir, receipt);
   if (opts.json === "true") console.log(JSON.stringify({ ...receipt, stoppedAt: outcome.stoppedAt, rolledBack: outcome.rolledBack, receiptPath: path }, null, 2));
   else {
@@ -7771,8 +7813,10 @@ async function codexForkCommand(sourceRef: string, opts: Record<string, string>)
       chmodSync(join(stagingHome, f.name), f.mode);
     }
     const dst = forkRolloutPath(stagingHome, startedAt, newThread);
-    rewrite = await rewriteRollout(srcRollout.path, dst, String(sp.codexThreadId), newThread);
-    say(`rollout copied: ${rewrite.lines} lines, ${rewrite.bytesOut} B, ${rewrite.replacements} id rewrites → ${dst}`);
+    // 源 rollout 记的 cwd(session_meta + 每个 turn_context)要改成新 workdir,否则 TUI 恢复后仍在源项目目录里干活。
+    const headerCwd = (() => { try { const first = readFileSync(srcRollout.path, "utf-8").split("\n", 1)[0]; return JSON.parse(first)?.payload?.cwd ?? null; } catch { return null; } })();
+    rewrite = await rewriteRollout(srcRollout.path, dst, String(sp.codexThreadId), newThread, typeof headerCwd === "string" && headerCwd ? { from: headerCwd, to: workdir } : undefined);
+    say(`rollout copied: ${rewrite.lines} lines, ${rewrite.bytesOut} B, ${rewrite.replacements} id rewrites, ${rewrite.cwdReplacements} cwd rewrites (${headerCwd ?? "?"} → ${workdir}) → ${dst}`);
     saveProfile(target, withTok);
     renameSync(stagingHome, join(targetNodesDir, target, "codex-home"));
     rmSync(staging, { recursive: true, force: true });
@@ -7814,6 +7858,171 @@ async function codexForkCommand(sourceRef: string, opts: Record<string, string>)
     checkIdentity(tfacts), checkHome(tfacts), checkSession(tfacts), workdirCheck, isolation,
     { key: "identity_attested", status: "unknown", detail: `not started yet — ${next.split("\n")[1].trim()}` },
   ], next);
+}
+
+// ── #1856 PR-D —— anet node codex account register|list|install / rollback ──
+function codexLoginRegistryDir(): string { return join(home, ".anet", "codex-login"); }
+function codexHostId(): string {
+  let mid: string | null = null;
+  for (const p of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) { try { mid = readFileSync(p, "utf-8").trim() || null; if (mid) break; } catch { /* next */ } }
+  return hostIdOf(mid, hostname());
+}
+function readAuthFingerprint(file: string): string | null {
+  try { return accountFingerprint(JSON.parse(readFileSync(file, "utf-8"))); } catch { return null; }
+}
+
+async function codexAccountCommand(sub: string, arg: string | undefined, opts: Record<string, string>) {
+  const json = opts.json === "true";
+  const dir = codexLoginRegistryDir();
+  const hostId = codexHostId();
+  if (sub === "register") {
+    const profileId = String(arg ?? "");
+    const from = String(opts["from-codex-home"] ?? "");
+    if (!profileId || !from) { console.error("Usage: anet node codex account register <profile-id> --from-codex-home <dir>"); process.exit(2); }
+    let ref; try { ref = parseSourceRef(`codex-login:${profileId}`); } catch (e: any) { console.error(`[anet] account register: ${e.message}`); process.exit(2); }
+    const authFile = join(from, "auth.json");
+    if (!existsSync(authFile)) { console.error(`[anet] account register: ${authFile} not found — log in there first (CODEX_HOME=${from} codex login)`); process.exit(2); }
+    let fp: string; try { fp = accountFingerprint(JSON.parse(readFileSync(authFile, "utf-8"))); } catch (e: any) { console.error(`[anet] account register: ${e.message}`); process.exit(2); }
+    const reg = readRegistry(dir, hostId);
+    if (reg.profiles[ref.profileId] && opts.force !== "true") { console.error(`[anet] account register: profile ${ref.profileId} already exists (fingerprint ${reg.profiles[ref.profileId].account_fingerprint}); pass --force to replace`); process.exit(2); }
+    const pdir = join(dir, "profiles", ref.profileId);
+    mkdirSync(pdir, { recursive: true, mode: 0o700 }); chmodSync(pdir, 0o700);
+    const tmp = join(pdir, `auth.json.tmp.${process.pid}`);
+    copyFileSync(authFile, tmp); chmodSync(tmp, 0o600); renameSync(tmp, join(pdir, "auth.json"));
+    const entry: RegistryEntry = { schema_version: 1, profile_id: ref.profileId, provider: "openai-chatgpt", host_id: hostId, credential_ref: credentialRefFor(ref.profileId), account_fingerprint: fp, created_at: new Date().toISOString(), last_model_probe_at: null, last_model_probe_status: null, revoked: false, disabled: false };
+    reg.profiles[ref.profileId] = entry; reg.host_id = hostId;
+    writeRegistry(dir, reg);
+    if (json) console.log(JSON.stringify({ ok: true, profile_id: ref.profileId, account_fingerprint: fp, host_id: hostId }, null, 2));
+    else console.log(`[anet] account register: codex-login:${ref.profileId} → fingerprint ${fp} (host-bound; credential stored 0600 in the local registry)`);
+    return;
+  }
+  if (sub === "list") {
+    const reg = readRegistry(dir, hostId);
+    const rows = Object.values(reg.profiles).map((e) => ({ profile_id: e.profile_id, provider: e.provider, account_fingerprint: e.account_fingerprint, host_ok: e.host_id === hostId, last_model_probe_at: e.last_model_probe_at, last_model_probe_status: e.last_model_probe_status, revoked: e.revoked, disabled: e.disabled }));
+    if (json) { console.log(JSON.stringify(rows, null, 2)); return; }
+    if (rows.length === 0) { console.log("[anet] no codex-login profiles registered on this host (anet node codex account register <id> --from-codex-home <dir>)"); return; }
+    for (const r of rows) console.log(`codex-login:${r.profile_id}  fp=${r.account_fingerprint}  host=${r.host_ok ? "ok" : "MISMATCH"}  probe=${r.last_model_probe_status ?? "-"}@${r.last_model_probe_at ?? "-"}${r.revoked ? "  REVOKED" : ""}${r.disabled ? "  DISABLED" : ""}`);
+    return;
+  }
+  if (sub !== "install") { console.error("Usage: anet node codex account <register|list|install> …"); process.exit(2); }
+  const alias = String(arg ?? "");
+  if (!alias) { console.error("Usage: anet node codex account install <alias> --source codex-login:<profile-id> [--probe-from <peer>] [--model <m>] [--json]"); process.exit(2); }
+  let src; try { src = parseSourceRef(String(opts.source ?? "")); } catch (e: any) { console.error(`[anet] account install: ${e.message}`); process.exit(2); }
+  const reg = readRegistry(dir, hostId);
+  let resolvedProfile; try { resolvedProfile = resolveProfile(dir, reg, src.profileId, hostId); } catch (e: any) { console.error(`[anet] account install: ${e.message}`); process.exit(2); }
+  const ctx = await codexLifecycleCtx("account-install", alias, opts);
+  // 与 start/restart 一样必须在 codexProjectDir 里跑(ctx 里的 cwd 守卫只看 start/restart/resume,这里补一次)。
+  if (ctx.profile.codexProjectDir) {
+    let here = process.cwd(); try { here = realpathSync(here); } catch { /* keep */ }
+    let want = String(ctx.profile.codexProjectDir); try { want = realpathSync(want); } catch { /* keep */ }
+    if (here !== want) { console.error(`[anet] account install: run this from the node's workdir: cd ${shellQuote(want)}`); process.exit(2); }
+  }
+  const peer = opts["probe-from"] ? resolveNodeRefAt(opts["probe-root"], String(opts["probe-from"])) : null;
+  if (opts["probe-from"] && !peer) { console.error(`[anet] account install: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
+  if (peer && peer.id === ctx.resolved.id) { console.error(`[anet] account install: --probe-from must be a *different* node`); process.exit(2); }
+  const restartActions = codexRestartActions({ ...ctx, verb: "restart" }, peer);
+  const receiptId = `${ctx.startedAt.toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
+  const targetAuth = join(ctx.codexHome, "auth.json");
+  const model = String(opts.model ?? ctx.profile.model ?? defaultCodexModelForRuntime("codex-app-server") ?? "");
+  const outcome = await runAccountInstall({ profileId: src.profileId, sourceFingerprint: resolvedProfile.entry.account_fingerprint }, {
+    preflightBlocks: async () => {
+      const facts = await ctx.gather();
+      return evaluateCodexPreflight(facts).filter((c) => c.status === "fail").map((c) => c.key);
+    },
+    currentFingerprint: async () => readAuthFingerprint(targetAuth),
+    probe: async () => {
+      // 隔离 staging HOME:只放 profile 的 auth.json + 目标的 config.toml;用 codex exec 发一次最小请求(零推理,固定回句)。
+      const staging = mkdtempSync(join(tmpdir(), "anet-codex-probe-"));
+      try {
+        const sh = join(staging, "home"); mkdirSync(sh, { mode: 0o700 });
+        copyFileSync(resolvedProfile.credentialFile, join(sh, "auth.json")); chmodSync(join(sh, "auth.json"), 0o600);
+        if (existsSync(join(ctx.codexHome, "config.toml"))) copyFileSync(join(ctx.codexHome, "config.toml"), join(sh, "config.toml"));
+        const wd = join(staging, "wd"); mkdirSync(wd);
+        const argv = ["exec", "--skip-git-repo-check", "--ephemeral", "--color", "never", "-s", "read-only", "-C", wd, ...(model ? ["-m", model] : []), "Reply with exactly ANET-PROBE-OK and nothing else."];
+        const r = spawnSync("codex", argv, { env: { ...process.env, CODEX_HOME: sh }, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 });
+        const status = classifyProbe(r.status, r.stdout ?? "", r.stderr ?? "");
+        const tail = `${r.stderr ?? ""}`.trim().split("\n").slice(-3).join(" | ").slice(0, 300);
+        ctx.say(`fresh model probe (${model || "default model"}) → ${status}`);
+        return { status, detail: status === "ok" ? `codex exec answered with the sentinel (model ${model || "default"})` : `exit ${r.status ?? "timeout"}: ${tail || "(no stderr)"}` };
+      } finally { rmSync(staging, { recursive: true, force: true }); }
+    },
+    backup: async () => {
+      const ref = backupRefFor(receiptId);
+      const dst = backupPathFor(ctx.nodeDir, ref);
+      mkdirSync(join(ctx.nodeDir, "receipts"), { recursive: true, mode: 0o700 });
+      if (existsSync(targetAuth)) { copyFileSync(targetAuth, dst); chmodSync(dst, 0o600); } else { writeFileSync(dst, "", { mode: 0o600 }); }
+      ctx.say(`backup → ${ref}`);
+      return { backupRef: ref };
+    },
+    install: async () => {
+      const tmp = `${targetAuth}.tmp.${process.pid}`;
+      copyFileSync(resolvedProfile.credentialFile, tmp); chmodSync(tmp, 0o600); renameSync(tmp, targetAuth);
+      ctx.say(`installed codex-login:${src.profileId} into CODEX_HOME (0600)`);
+    },
+    restart: async () => runCodexRestart("restart", restartActions),
+    restore: async (ref) => {
+      const bak = backupPathFor(ctx.nodeDir, ref);
+      if (statSync(bak).size === 0) { rmSync(targetAuth, { force: true }); return; }
+      const tmp = `${targetAuth}.tmp.${process.pid}`;
+      copyFileSync(bak, tmp); chmodSync(tmp, 0o600); renameSync(tmp, targetAuth);
+      ctx.say(`restored previous auth.json from ${ref}`);
+    },
+    recordProbe: async (status: ProbeStatus) => {
+      const r2 = readRegistry(dir, hostId);
+      const e = r2.profiles[src.profileId]; if (!e) return;
+      e.last_model_probe_at = new Date().toISOString(); e.last_model_probe_status = status;
+      writeRegistry(dir, r2);
+    },
+  });
+  const receipt = buildReceipt({ verb: "account-install", alias: ctx.displayName, nodeId: ctx.profile.node_id ?? null, startedAt: ctx.startedAt, checks: outcome.checks });
+  const withRef = { ...receipt, id: receiptId, source_profile_id: src.profileId, source_account_fingerprint: resolvedProfile.entry.account_fingerprint, backup_ref: outcome.backupRef, stoppedAt: outcome.stoppedAt, rolledBack: outcome.rolledBack };
+  const path = writeReceipt(ctx.nodeDir, withRef as any);
+  if (json) console.log(JSON.stringify({ ...withRef, receiptPath: path }, null, 2));
+  else { console.log(formatReceiptSummary(receipt)); console.log(`stopped at: ${outcome.stoppedAt}${outcome.rolledBack ? " (rolled back)" : ""}`); if (outcome.backupRef) console.log(`backup_ref: ${outcome.backupRef}   (rollback: anet node codex rollback ${shellQuote(ctx.displayName)} --receipt ${receiptId})`); console.log(`receipt: ${path}`); }
+  process.exit(receipt.verdict === "PASS" ? 0 : 2);
+}
+
+async function codexRollbackCommand(alias: string, opts: Record<string, string>) {
+  const json = opts.json === "true";
+  const receiptId = String(opts.receipt ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{3,80}$/.test(receiptId)) { console.error("Usage: anet node codex rollback <alias> --receipt <install-receipt-id> [--probe-from <peer>]"); process.exit(2); }
+  const ctx = await codexLifecycleCtx("rollback", alias, opts);
+  if (ctx.profile.codexProjectDir) {
+    let here = process.cwd(); try { here = realpathSync(here); } catch { /* keep */ }
+    let want = String(ctx.profile.codexProjectDir); try { want = realpathSync(want); } catch { /* keep */ }
+    if (here !== want) { console.error(`[anet] rollback: run this from the node's workdir: cd ${shellQuote(want)}`); process.exit(2); }
+  }
+  const peer = opts["probe-from"] ? resolveNodeRefAt(opts["probe-root"], String(opts["probe-from"])) : null;
+  if (opts["probe-from"] && !peer) { console.error(`[anet] rollback: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
+  const restartActions = codexRestartActions({ ...ctx, verb: "restart" }, peer);
+  const targetAuth = join(ctx.codexHome, "auth.json");
+  const outcome = await runRollback({
+    readInstallReceipt: async () => {
+      const p = join(ctx.nodeDir, "receipts", `${receiptId}.json`);
+      if (!existsSync(p)) return null;
+      try {
+        const r = JSON.parse(readFileSync(p, "utf-8"));
+        if (r?.verb !== "account-install" || typeof r?.backup_ref !== "string") return null;
+        const prev = r.checks?.find?.((c: any) => c?.key === "account_probe")?.evidence?.targetPreviousFingerprint ?? null;
+        return { backupRef: r.backup_ref, targetPreviousFingerprint: typeof prev === "string" ? prev : null };
+      } catch { return null; }
+    },
+    backupExists: async (ref) => { try { return existsSync(backupPathFor(ctx.nodeDir, ref)); } catch { return false; } },
+    restore: async (ref) => {
+      const bak = backupPathFor(ctx.nodeDir, ref);
+      if (statSync(bak).size === 0) { rmSync(targetAuth, { force: true }); return; }
+      const tmp = `${targetAuth}.tmp.${process.pid}`;
+      copyFileSync(bak, tmp); chmodSync(tmp, 0o600); renameSync(tmp, targetAuth);
+      ctx.say(`restored auth.json from ${ref}`);
+    },
+    restart: async () => runCodexRestart("restart", restartActions),
+    currentFingerprint: async () => readAuthFingerprint(targetAuth),
+  });
+  const receipt = buildReceipt({ verb: "rollback", alias: ctx.displayName, nodeId: ctx.profile.node_id ?? null, startedAt: ctx.startedAt, checks: outcome.checks });
+  const path = writeReceipt(ctx.nodeDir, { ...receipt, rolled_back_from: receiptId, backup_ref: outcome.backupRef } as any);
+  if (json) console.log(JSON.stringify({ ...receipt, rolledBackFrom: receiptId, backupRef: outcome.backupRef, stoppedAt: outcome.stoppedAt, receiptPath: path }, null, 2));
+  else { console.log(formatReceiptSummary(receipt)); console.log(`stopped at: ${outcome.stoppedAt}`); console.log(`receipt: ${path}`); }
+  process.exit(receipt.verdict === "PASS" ? 0 : 2);
 }
 
 async function resumeCommand() {
