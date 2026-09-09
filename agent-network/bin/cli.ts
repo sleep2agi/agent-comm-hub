@@ -3867,7 +3867,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
-  anet node codex <preflight|verify> <name>  Codex TUI co-presence lifecycle checks (#1856; receipts, fail-closed)
+  anet node codex <verb> <ref>  Codex TUI co-presence checks: preflight|verify (#1856)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
