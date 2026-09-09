@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { descendants, envFileTokenFingerprint, findRollouts, gatherCodexFacts, type FactPrimitives } from "./codex-lifecycle-facts";
+import { descendants, envFileTokenFingerprint, findRollouts, gatherCodexFacts, goalsFileState, type FactPrimitives } from "./codex-lifecycle-facts";
 import { shortFingerprint } from "./codex-lifecycle-receipt";
 
 const cleanup: string[] = [];
@@ -90,5 +90,21 @@ describe("process tree + gather", () => {
     expect(f.topology.live).toEqual({ appsrv: null, bridge: null, tui: null });
     expect(f.port).toEqual({ port: null, owner: null });
     expect(f.hubNodeId).toBeNull();
+  });
+});
+
+describe("#1856 PR-B goalsFileState", () => {
+  const j = join;
+  test("no goals.json → none; v1 with an active goal → active; foreign schema → unknown", () => {
+    const d = mkdtempSync(j(tmpdir(), "anet-goals-"));
+    expect(goalsFileState(d).state).toBe("none");
+    writeFileSync(j(d, "goals.json"), JSON.stringify({ version: 1, goals: [{ status: "achieved" }, { status: "active" }] }));
+    const a = goalsFileState(d);
+    expect(a.state).toBe("active");
+    expect(a.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+    writeFileSync(j(d, "goals.json"), JSON.stringify({ version: 2, items: [] }));
+    expect(goalsFileState(d).state).toBe("unknown");
+    writeFileSync(j(d, "goals.json"), "{not json");
+    expect(goalsFileState(d).state).toBe("unknown");
   });
 });

@@ -136,7 +136,7 @@ tmux capture-pane -t =<alias> -p | grep "Allow the commhub MCP"
 实测（2026-07-31）：新建 TUI 的节点复现；同宿主既有共存节点未受影响（它们的 app-server 启动时带了 `approval_policy=never`）。**所以这是「新建 TUI 时」的坑，不是存量问题。**
 :::
 
-## 生命周期命令：`anet node codex …`(只读核对先落地)
+## 生命周期命令：`anet node codex …`
 
 重启 / 恢复共存节点以前靠人肉 runbook(见「Codex TUI 节点安全重启」);现在把每一步「核什么」做成确定性的 CLI,正常流程不调用任何 LLM,只出机器可读 receipt。第一批两个只读命令:
 
@@ -144,6 +144,20 @@ tmux capture-pane -t =<alias> -p | grep "Allow the commhub MCP"
 anet node codex preflight <alias>          # 只读核对,exit 0 = PASS / exit 2 = FAIL
 anet node codex verify    <alias> --json   # preflight + 子进程环境核对 + 跨节点身份验收;JSON 供自动化消费
 ```
+
+### 重启 / 启动 / 恢复:确定性状态机,零 LLM
+
+```bash
+anet node codex restart <alias> --probe-from <另一个本地节点>   # 停 Bridge→TUI→App Server,再起,再核对
+anet node codex start   <alias> --probe-from <peer>              # 三段都不在时才允许;否则要求用 restart
+anet node codex resume  <alias> --thread <36 位 thread id> --probe-from <peer>
+```
+
+`restart` 的每一步顺序固定、不做推理:**preflight(before)** 任一项 fail 就不碰进程 → 读 **goal 状态**(读不到或 schema 不认识 = 不明,直接 STOP)→ 按依赖反向 **停 Bridge → TUI → App Server**(先断任务入口,再让 TUI 把 rollout 刷完,最后放掉端口)→ 等 rollout 字节数稳定(大会话慢刷盘)→ 等端口空闲(占用者若核实是本节点残留的 app-server 才定向 TERM,外来进程一律 FAIL 不动)→ 交给启动器 `anet node start --copresence --tui-first`(**App Server → 端口就绪 → exact-session TUI 完全恢复 → Bridge**;bridge 晚于 TUI,任务不会落到人看不见的会话上)→ **verify(after)**:preflight 全项 + 子进程环境 + rollout 前后比对(同一文件、字节只增不减)+ goal 文件未变 + hub 回到在线 + 跨节点 nonce 验收。启动失败自动回滚一次(按原配置再起);再失败就停在已停状态,receipt 记到哪一步。
+
+`--probe-from <peer>` 用另一个本地节点通过 hub 给目标发一条带随机 nonce 的任务,等目标回复经 hub 落到 peer 的收件箱,且 hub 标注的发送者正是目标 alias,`identity_attested` 才算 pass;不给 peer 时该项 unknown,整体 **FAIL**(有意:不许「大概是它」)。`resume --thread` 只接受完整 36 位 id 且该 id 在本节点 CODEX_HOME 下恰有一个 rollout,才写进 config;不接受前缀,不猜「最近一个」。
+
+`--json` 输出整份 receipt(含 `stoppedAt` / `rolledBack`),供 Dashboard「体检」按钮消费。
 
 `preflight` 核的项(每项 pass / fail / unknown,**任一非 pass 整体 FAIL**,不许部分成功):alias 与 hub 名册里的 `node_id` 精确匹配;节点自己的 `CODEX_HOME` 0700、`auth.json` 0600、CommHub token 指纹一致;工作目录在 config、TUI 进程 cwd、TUI `-C`、Bridge 进程四处一致;`codexThreadId` 是完整 36 位且 `CODEX_HOME` 里恰有一个对应 rollout(记下绝对路径、inode、字节数、mtime;不接受前缀或「最近的文件」);app-server 端口的占用者确实是本节点的进程(否则视为 foreign PID,不会去动它);tmux 三段(app-server / TUI / bridge)都在跑且子进程都带本节点的身份 marker。
 

@@ -142,8 +142,8 @@ cp /tmp/test1220-windows.ts agent-network/src/windows-codex-copresence.ts
 
 echo "L2e witnessed-red: wrong TUI CODEX_HOME cannot pass source health contract"
 bun /mutate.ts agent-network/bin/cli.ts \
-  $'const tuiCmd = [\n    `export CODEX_HOME=${shellQuote(opts.codexHome)}`,' \
-  $'const tuiCmd = [\n    `export CODEX_HOME=/tmp/test1220-wrong-home`,'
+  $'const tuiCmd = [\n      `export CODEX_HOME=${shellQuote(opts.codexHome)}`,' \
+  $'const tuiCmd = [\n      `export CODEX_HOME=/tmp/test1220-wrong-home`,'
 expect_red wrong-home bun test agent-network/src/codex-copresence-launch-readiness.test.ts
 cp /tmp/test1220-cli.ts agent-network/bin/cli.ts
 

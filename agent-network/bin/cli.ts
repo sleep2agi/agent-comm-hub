@@ -37,7 +37,8 @@ import {
 } from "../src/copresence-identity";
 import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb } from "../src/codex-lifecycle-receipt";
 import { evaluateCodexPreflight, evaluateCodexVerify } from "../src/codex-lifecycle-preflight";
-import { gatherCodexFacts, realPrimitives } from "../src/codex-lifecycle-facts";
+import { gatherCodexFacts, realPrimitives, findRollouts, processFact, goalsFileState } from "../src/codex-lifecycle-facts";
+import { runCodexRestart, type RestartActions, type GoalState as LifecycleGoalState } from "../src/codex-lifecycle-restart";
 import { alreadyRunningMessage, runningNodePid } from "../src/node-running-guard";
 import { assertTmuxSupportsSessionEnv } from "../src/tmux-capability";
 import { classifySessionStatus, summarizeSessions } from "../src/session-status-class";
@@ -592,6 +593,8 @@ interface CopresenceOptions {
   inheritCodexHome: boolean;
   hub: string;
   token: string;
+  /** #1856 PR-B: restore the exact-session TUI before attaching the bridge (thread must be known). */
+  tuiFirst?: boolean;
 }
 
 /** True once `${hub}/health` answers. Unauthenticated on purpose: we only need
@@ -1555,89 +1558,121 @@ async function startCopresenceOrchestration(nodeId: string, opts: CopresenceOpti
   delete rawCfg.session;
   atomicWritePrivateJson(rawCfgPath, rawCfg);
 
-  // ── piece ② bridge (agent-node adopt mode) ────────────────────────────
-  // The bridge re-invokes `anet node start` in foreground under tmux; that
-  // path reads codexAppServerUrl / codexThreadId from the config we just
-  // wrote and spawns agent-node in adopt mode. Same launchAgent()
-  // codepath as the non-copresence case — no fork of the bridge dispatch.
-  const bridgeCmd = [
-    `export CODEX_HOME=${shellQuote(opts.codexHome)}`,
-    `unset COMMHUB_TOKEN ANET_CODEX_COMMHUB_TOKEN`,
-    `exec anet node start ${shellQuote(displayName)}`,
-  ].join(" && ");
-  try {
-    execFileSync("tmux", [
-      "new-session", "-d", "-s", bridgeSession, "-c", process.cwd(),
-      "-e", `ANET_NODE_MARKER=${identityMarker}`,
-      "-e", "ANET_COPRESENCE_BRIDGE=1",
-      "bash", "-lc", bridgeCmd,
-    ], { stdio: "pipe" });
-  } catch (e: any) {
-    console.error(`[anet] ❌ tmux new-session ${bridgeSession} failed: ${e?.message || e}`);
-    console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
-    process.exit(1);
+  // #1856 PR-B — restart/resume run with --tui-first: the exact-session TUI must be
+  // fully restored before the bridge attaches, so no task can reach a thread the
+  // human cannot yet see. Only meaningful when the thread is already known; a
+  // fresh/pending node keeps bridge-first because the bridge promotes the thread.
+  const tuiFirst = opts.tuiFirst === true && !freshDeferred && !pendingRecoveryId;
+  if (opts.tuiFirst === true && !tuiFirst) {
+    console.log(`[anet] --tui-first ignored: thread not yet known (fresh/pending) — bridge attaches first`);
   }
-  console.log(`[anet] ② bridge tmux=${bridgeSession} starting…`);
-  const bridgeReceipt = pendingRecoveryId
-    ? bridgeClientHealthReceipt(wsUrl, pendingRecoveryId)
-    : freshDeferred
-      ? "[codex-app-server] client-health role=bridge state=waiting-for-tui-thread"
-      : bridgeClientHealthReceipt(wsUrl, threadId);
-  const bridgeReady = await waitForTmuxPaneText(
-    bridgeSession,
-    bridgeReceipt,
-    25_000,
-  );
-  if (!bridgeReady) {
-    console.error(`[anet] ❌ bridge did not attach to the shared app-server before TUI launch.`);
-    console.error(`[anet]    Debug:   tmux attach -t ${shellQuote(`=${bridgeSession}`)}`);
-    console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
-    process.exit(1);
-  }
-  if (pendingRecoveryId) {
-    const promoted = JSON.parse(readFileSync(rawCfgPath, "utf-8"));
+  const launchBridge = async () => {
+    // ── piece ② bridge (agent-node adopt mode) ────────────────────────────
+    // The bridge re-invokes `anet node start` in foreground under tmux; that
+    // path reads codexAppServerUrl / codexThreadId from the config we just
+    // wrote and spawns agent-node in adopt mode. Same launchAgent()
+    // codepath as the non-copresence case — no fork of the bridge dispatch.
+    const bridgeCmd = [
+      `export CODEX_HOME=${shellQuote(opts.codexHome)}`,
+      `unset COMMHUB_TOKEN ANET_CODEX_COMMHUB_TOKEN`,
+      `exec anet node start ${shellQuote(displayName)}`,
+    ].join(" && ");
     try {
-      threadId = requirePromotedCodexPendingThread(promoted, pendingRecoveryId);
-    } catch {
-      console.error(`[anet] ❌ bridge reported ready without atomically promoting the exact pending Codex thread.`);
-      console.error(`[anet]    Fail-closed: TUI was not started; no thread was guessed or created.`);
+      execFileSync("tmux", [
+        "new-session", "-d", "-s", bridgeSession, "-c", process.cwd(),
+        "-e", `ANET_NODE_MARKER=${identityMarker}`,
+        "-e", "ANET_COPRESENCE_BRIDGE=1",
+        "bash", "-lc", bridgeCmd,
+      ], { stdio: "pipe" });
+    } catch (e: any) {
+      console.error(`[anet] ❌ tmux new-session ${bridgeSession} failed: ${e?.message || e}`);
+      console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
       process.exit(1);
     }
-    freshDeferred = false;
+    console.log(`[anet] ② bridge tmux=${bridgeSession} starting…`);
+    const bridgeReceipt = pendingRecoveryId
+      ? bridgeClientHealthReceipt(wsUrl, pendingRecoveryId)
+      : freshDeferred
+        ? "[codex-app-server] client-health role=bridge state=waiting-for-tui-thread"
+        : bridgeClientHealthReceipt(wsUrl, threadId);
+    const bridgeReady = await waitForTmuxPaneText(
+      bridgeSession,
+      bridgeReceipt,
+      25_000,
+    );
+    if (!bridgeReady) {
+      console.error(`[anet] ❌ bridge did not attach to the shared app-server before TUI launch.`);
+      console.error(`[anet]    Debug:   tmux attach -t ${shellQuote(`=${bridgeSession}`)}`);
+      console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
+      process.exit(1);
+    }
+    if (pendingRecoveryId) {
+      const promoted = JSON.parse(readFileSync(rawCfgPath, "utf-8"));
+      try {
+        threadId = requirePromotedCodexPendingThread(promoted, pendingRecoveryId);
+      } catch {
+        console.error(`[anet] ❌ bridge reported ready without atomically promoting the exact pending Codex thread.`);
+        console.error(`[anet]    Fail-closed: TUI was not started; no thread was guessed or created.`);
+        process.exit(1);
+      }
+      freshDeferred = false;
+    }
+    console.log(freshDeferred
+      ? `[anet] ② bridge connected; waiting for the TUI-owned thread`
+      : `[anet] ② bridge READY on ${wsUrl}`);
+  };
+  const launchTui = () => {
+    // ── piece ③ codex TUI (attachable, resumes same thread) ───────────────
+    const tuiArgv = codexTuiLaunchArgs(wsUrl, model, freshDeferred ? undefined : threadId, opts.dangerFullAccess);
+    const tuiInvocation = `exec ${shellQuote(opts.codexBin)} ${tuiArgv.map(shellQuote).join(" ")}`;
+    const tuiCmd = [
+      `export CODEX_HOME=${shellQuote(opts.codexHome)}`,
+      tuiInvocation,
+    ].join(" ; ");
+    try {
+      execFileSync("tmux", [
+        "new-session", "-d", "-s", tuiSession, "-c", process.cwd(),
+        "-e", `ANET_NODE_MARKER=${identityMarker}`,
+        "bash", "-lc", tuiCmd,
+      ], { stdio: "pipe" });
+    } catch (e: any) {
+      console.error(`[anet] ❌ tmux new-session ${tuiSession} failed: ${e?.message || e}`);
+      console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
+      process.exit(1);
+    }
+    // The OpenCode co-presence twin checks its TUI session before calling the
+    // node ready; this path did not, so `③ TUI … ready to attach` and the 就绪
+    // line below were printed on the strength of `new-session` not throwing. A
+    // TUI that exits during startup (bad codex binary, unusable CODEX_HOME) left
+    // both lines saying ready. Keep the two paths aligned.
+    if (!tmuxSessionRunning(tuiSession)) {
+      console.error(`[anet] ❌ TUI tmux session ${tuiSession} exited during startup.`);
+      console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
+      process.exit(1);
+    }
+    console.log(`[anet] ③ TUI tmux=${tuiSession} ready to attach`);
+  };
+  const requireTuiPainted = async () => {
+    const TUI_PAINT_TIMEOUT_MS = 40_000;
+    const tuiState = await codexTuiStateAfterRender(tuiSession, TUI_PAINT_TIMEOUT_MS);
+    if (tuiState !== "usable") {
+      console.error("");
+      console.error(tuiState === "not-painted"
+        ? describeCodexTuiNotPainted(displayName, tuiSession, TUI_PAINT_TIMEOUT_MS)
+        : describeCodexTuiBlocker(tuiState, displayName, tuiSession));
+      console.error(`[anet]   The sessions are left running so you can look; or: anet node stop ${shellQuote(displayName)}`);
+      process.exit(1);
+    }
+  };
+  if (tuiFirst) {
+    launchTui();
+    await requireTuiPainted();
+    console.log(`[anet] ③→② TUI restored on the exact session; attaching the bridge now (--tui-first)`);
+    await launchBridge();
+  } else {
+    await launchBridge();
+    launchTui();
   }
-  console.log(freshDeferred
-    ? `[anet] ② bridge connected; waiting for the TUI-owned thread`
-    : `[anet] ② bridge READY on ${wsUrl}`);
-
-  // ── piece ③ codex TUI (attachable, resumes same thread) ───────────────
-  const tuiArgv = codexTuiLaunchArgs(wsUrl, model, freshDeferred ? undefined : threadId, opts.dangerFullAccess);
-  const tuiInvocation = `exec ${shellQuote(opts.codexBin)} ${tuiArgv.map(shellQuote).join(" ")}`;
-  const tuiCmd = [
-    `export CODEX_HOME=${shellQuote(opts.codexHome)}`,
-    tuiInvocation,
-  ].join(" ; ");
-  try {
-    execFileSync("tmux", [
-      "new-session", "-d", "-s", tuiSession, "-c", process.cwd(),
-      "-e", `ANET_NODE_MARKER=${identityMarker}`,
-      "bash", "-lc", tuiCmd,
-    ], { stdio: "pipe" });
-  } catch (e: any) {
-    console.error(`[anet] ❌ tmux new-session ${tuiSession} failed: ${e?.message || e}`);
-    console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
-    process.exit(1);
-  }
-  // The OpenCode co-presence twin checks its TUI session before calling the
-  // node ready; this path did not, so `③ TUI … ready to attach` and the 就绪
-  // line below were printed on the strength of `new-session` not throwing. A
-  // TUI that exits during startup (bad codex binary, unusable CODEX_HOME) left
-  // both lines saying ready. Keep the two paths aligned.
-  if (!tmuxSessionRunning(tuiSession)) {
-    console.error(`[anet] ❌ TUI tmux session ${tuiSession} exited during startup.`);
-    console.error(`[anet]    Cleanup: anet node stop ${shellQuote(displayName)}`);
-    process.exit(1);
-  }
-  console.log(`[anet] ③ TUI tmux=${tuiSession} ready to attach`);
 
   // #P3fix复审 finding #5 — best-effort marker-file update with bridge/tui
   // observability hints now that both sessions are up. Marker file was
@@ -1667,16 +1702,7 @@ async function startCopresenceOrchestration(nodeId: string, opts: CopresenceOpti
   // 就绪 has to mean "can take a task", not "three sessions exist". Both times
   // a node was unusable on 2026-08-20 the ✅ had already been printed over a
   // TUI parked on an interactive prompt.
-  const TUI_PAINT_TIMEOUT_MS = 40_000;
-  const tuiState = await codexTuiStateAfterRender(tuiSession, TUI_PAINT_TIMEOUT_MS);
-  if (tuiState !== "usable") {
-    console.error("");
-    console.error(tuiState === "not-painted"
-      ? describeCodexTuiNotPainted(displayName, tuiSession, TUI_PAINT_TIMEOUT_MS)
-      : describeCodexTuiBlocker(tuiState, displayName, tuiSession));
-    console.error(`[anet]   The sessions are left running so you can look; or: anet node stop ${shellQuote(displayName)}`);
-    process.exit(1);
-  }
+  if (!tuiFirst) await requireTuiPainted();
 
   // #1342 同族副本:这里原本也把**两种处境**折叠成同一句。
   //   !tuiIdentity            → 连 TUI 的 pid 都没拿到(会话名对不上 / 会话刚没了)
@@ -3867,7 +3893,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
-  anet node codex <verb> <ref>  Codex TUI co-presence checks: preflight|verify (#1856)
+  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume (#1856)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -4047,6 +4073,8 @@ Options:
   --yes-danger-full-access    Required with the previous flag in non-TTY use
   --no-inherit-codex-home     Do not stage the host's codex auth.json /
                               version.json into the node's isolated CODEX_HOME.
+  --tui-first                 Restore the exact-session TUI before the bridge attaches
+                              (thread must be known; used by node codex restart)
                               Without them the TUI parks on the sign-in page or
                               the update prompt; use this only if you intend to
                               sign in inside that HOME yourself.
@@ -7144,6 +7172,7 @@ async function startCommand() {
       yesDangerFullAccess: opts["yes-danger-full-access"] === "true",
       hub: profileHub,
       token: profileTok,
+      tuiFirst: opts["tui-first"] === "true",
     });
     return;
   }
@@ -7419,15 +7448,19 @@ async function codexLifecycleCommand() {
   const ref = args[2];
   const opts = parseOpts();
   const usage = () => {
-    console.error("Usage: anet node codex <preflight|verify> <alias> [--json]");
+    console.error("Usage: anet node codex <preflight|verify|start|restart|resume> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
     console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
     console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
     console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
-    console.error("  start / restart / resume / fork / account / rollback:见 #1856,分 PR 落地");
+    console.error("  restart    确定性状态机(零 LLM):preflight → goal 状态 → 停 Bridge→TUI→App Server → 端口放掉 → 起(App Server→端口→exact TUI→Bridge)→ verify");
+    console.error("             --probe-from <peer>  用另一本地节点发 nonce 探针做跨节点身份验收(identity_attested;不给则 unknown → FAIL)");
+    console.error("  start      同 restart 但要求三段都不在;resume --thread <id> 先把 exact thread 写进 config(要求唯一 rollout)再 start");
+    console.error("  fork / account / rollback:见 #1856,PR-C..E");
   };
-  if (!verb || !ref || !["preflight", "verify"].includes(verb)) {
-    if (verb && !["preflight", "verify"].includes(verb) && ["start", "restart", "resume", "fork", "account", "rollback"].includes(verb)) {
-      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-B..E). Use \`anet node codex preflight <alias>\` today.`);
+  const landed = ["preflight", "verify", "start", "restart", "resume"];
+  if (!verb || !ref || !landed.includes(verb)) {
+    if (verb && ["fork", "account", "rollback"].includes(verb)) {
+      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-C..E).`);
       process.exit(2);
     }
     usage(); process.exit(verb ? 2 : 0);
@@ -7447,26 +7480,185 @@ async function codexLifecycleCommand() {
     : { appsrv: null, bridge: null, tui: null };
   const gc = loadGlobal();
   const startedAt = new Date();
-  const facts = await gatherCodexFacts(realPrimitives({ hub: profile.hub || gc.hub, token: profile.token || gc.token, networkId: profile.network_id || gc.network_id }), {
-    alias: displayName,
-    nodeId: profile.node_id ?? null,
-    nodeDir,
-    codexHome: join(nodeDir, "codex-home"),
-    configToken: profile.token ?? null,
-    codexProjectDir: profile.codexProjectDir ?? null,
-    codexThreadId: profile.codexThreadId ?? null,
-    codexAppServerUrl: profile.codexAppServerUrl ?? null,
-    sessions: copresenceTmuxSessions(displayName),
-    recordedPids: recorded,
-    markerUuid: marker.kind === "ok" ? marker.marker.marker : null,
-  });
-  const checks = verb === "preflight"
-    ? evaluateCodexPreflight(facts)
-    : evaluateCodexVerify(facts, { key: "identity_attested", status: "unknown", detail: "cross-node nonce probe not landed yet (#1856 PR-B) — verify cannot PASS before it" });
-  const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks });
+  const hub: string = profile.hub || gc.hub;
+  const codexHome = join(nodeDir, "codex-home");
+  const sessions = copresenceTmuxSessions(displayName);
+  const prim = realPrimitives({ hub, token: profile.token || gc.token, networkId: profile.network_id || gc.network_id });
+  const gather = async () => {
+    const m = readMarker(nodesDir(), resolved.id);
+    const rec = m.kind === "ok"
+      ? { appsrv: m.marker.sessions.appsrv?.pid ?? null, bridge: m.marker.sessions.bridge?.pid ?? null, tui: m.marker.sessions.tui?.pid ?? null }
+      : recorded;
+    const prof = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
+    return gatherCodexFacts(prim, {
+      alias: displayName,
+      nodeId: prof.node_id ?? null,
+      nodeDir,
+      codexHome,
+      configToken: prof.token ?? null,
+      codexProjectDir: prof.codexProjectDir ?? null,
+      codexThreadId: prof.codexThreadId ?? null,
+      codexAppServerUrl: prof.codexAppServerUrl ?? null,
+      sessions,
+      recordedPids: rec,
+      markerUuid: m.kind === "ok" ? m.marker.marker : null,
+    });
+  };
+  const unattested = { key: "identity_attested", status: "unknown" as const, detail: "cross-node nonce probe not run — pass --probe-from <peer> (restart/start/resume) for attestation" };
+  if (verb === "preflight" || verb === "verify") {
+    const facts = await gather();
+    const checks = verb === "preflight" ? evaluateCodexPreflight(facts) : evaluateCodexVerify(facts, unattested);
+    const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks });
+    const path = writeReceipt(nodeDir, receipt);
+    if (opts.json === "true") console.log(JSON.stringify({ ...receipt, receiptPath: path }, null, 2));
+    else { console.log(formatReceiptSummary(receipt)); console.log(`receipt: ${path}`); }
+    process.exit(receipt.verdict === "PASS" ? 0 : 2);
+  }
+
+  // ── start / restart / resume:确定性状态机(src/codex-lifecycle-restart.ts),这里只提供真实动作 ──
+  const say = (m: string) => { if (opts.json !== "true") console.log(`[anet] codex ${verb}: ${m}`); };
+  if (verb === "resume") {
+    const thread = String(opts.thread ?? "");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)) {
+      console.error(`[anet] node codex resume: --thread <36-char thread id> is required (no prefix, no "latest" guessing)`);
+      process.exit(2);
+    }
+    const matches = findRollouts(codexHome, thread);
+    if (matches.length !== 1) {
+      console.error(`[anet] node codex resume: thread ${thread} has ${matches.length} rollout file(s) under this node's CODEX_HOME — need exactly one; refusing`);
+      process.exit(2);
+    }
+    const stored = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
+    if (stored.codexThreadId !== thread) {
+      saveProfile(resolved.id, { ...(stored as any), codexThreadId: thread });
+      say(`config codexThreadId ${stored.codexThreadId ?? "(none)"} → ${thread} (rollout ${matches[0].path})`);
+    }
+  }
+  const port = (() => { try { return profile.codexAppServerUrl ? Number(new URL(profile.codexAppServerUrl).port) || null : null; } catch { return null; } })();
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const sessionIdExact = (name: string): string | null => {
+    try {
+      const out = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}\t#{session_id}"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
+      for (const line of out.split("\n")) { const [n, id] = line.split("\t"); if (n === name && id) return id; }
+    } catch { /* no server */ }
+    return null;
+  };
+  const goalState = async (): Promise<{ state: LifecycleGoalState; fingerprint: string | null }> => goalsFileState(nodeDir);
+  const peer = opts["probe-from"] ? resolveNodeRef(String(opts["probe-from"])) : null;
+  if (opts["probe-from"] && !peer) { console.error(`[anet] node codex ${verb}: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
+  if (peer && peer.id === resolved.id) { console.error(`[anet] node codex ${verb}: --probe-from must be a *different* node`); process.exit(2); }
+  const actions: RestartActions = {
+    gate: async (phase) => {
+      const facts = await gather();
+      const checks = phase === "before" ? evaluateCodexPreflight(facts) : evaluateCodexVerify(facts, unattested);
+      const rollout = facts.session.rolloutMatches.length === 1 ? facts.session.rolloutMatches[0] : null;
+      say(`${phase}: ${checks.filter((c) => c.status === "pass").length}/${checks.length} pass`);
+      return { checks, rollout, port: { port, ownerPid: facts.port.owner?.pid ?? null, ownerIsOurs: facts.port.owner ? facts.port.owner.codexHome === facts.home.dir : null } };
+    },
+    goalState,
+    liveSessions: async () => ({ bridge: prim.tmuxPanePid(sessions.bridge) !== null, tui: prim.tmuxPanePid(sessions.tui) !== null, appsrv: prim.tmuxPanePid(sessions.appsrv) !== null }),
+    stopSession: async (role) => {
+      const name = sessions[role];
+      const id = sessionIdExact(name);
+      if (!id) return { ok: true, detail: `${name} already gone` };
+      try { execFileSync("tmux", ["kill-session", "-t", id], { stdio: "pipe" }); } catch (e: any) { return { ok: false, detail: `tmux kill-session ${id}: ${e?.message ?? e}` }; }
+      const deadline = Date.now() + (role === "tui" ? 20_000 : 10_000);
+      while (Date.now() < deadline) { if (prim.tmuxPanePid(name) === null) { say(`stopped ${role} (${name})`); return { ok: true, detail: `${name} gone` }; } await sleep(250); }
+      return { ok: false, detail: `${name} still alive after kill-session` };
+    },
+    waitRolloutSettled: async (before) => {
+      const prof = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
+      const tid = prof.codexThreadId ?? null;
+      let last: number | null = null; let stable = 0;
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const m = findRollouts(codexHome, tid);
+        if (m.length !== 1) return before && m.length === 0 ? null : (m[0] ?? null);
+        if (last === m[0].bytes) { if (++stable >= 2) return m[0]; } else { stable = 0; last = m[0].bytes; }
+        await sleep(1000);
+      }
+      return findRollouts(codexHome, tid)[0] ?? null;
+    },
+    waitPortFree: async () => {
+      if (!port) return { free: true, ownerPid: null, ownerIsOurs: null };
+      const deadline = Date.now() + 30_000;
+      let pid: number | null = null;
+      while (Date.now() < deadline) { pid = prim.listeningPid(port); if (pid === null) return { free: true, ownerPid: null, ownerIsOurs: null }; await sleep(500); }
+      const pf = pid === null ? null : processFact(prim, pid);
+      const ours = pf ? pf.codexHome !== null && pf.codexHome === codexHome && pf.argv.some((a) => /app-server/.test(a)) : null;
+      return { free: false, ownerPid: pid, ownerIsOurs: ours };
+    },
+    termOwnedPid: async (pid) => {
+      try { process.kill(pid, "SIGTERM"); } catch (e: any) { return { ok: false, detail: `kill ${pid}: ${e?.message ?? e}` }; }
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) { try { process.kill(pid, 0); } catch { return { ok: true, detail: `pid ${pid} exited` }; } await sleep(250); }
+      return { ok: false, detail: `pid ${pid} survived SIGTERM for 10s (not escalating)` };
+    },
+    start: async () => {
+      const prof = (loadStoredProfile(resolved.id) ?? profile) as Record<string, any>;
+      const argv = [process.argv[1], "node", "start", displayName, "--copresence", "--tui-first"];
+      if (prof.codexCopresenceFullAccess) argv.push("--dangerously-allow-full-access", "--yes-danger-full-access");
+      const env = { ...process.env }; delete env.ANET_COPRESENCE_BRIDGE; delete env.ANET_NODE_MARKER;
+      say(`launching: anet node start ${shellQuote(displayName)} --copresence --tui-first`);
+      const r = spawnSync(process.execPath, argv, { env, encoding: "utf-8", timeout: 240_000, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 8 * 1024 * 1024 });
+      const tail = `${r.stdout ?? ""}\n${r.stderr ?? ""}`.trim().split("\n").slice(-12).join("\n");
+      if (r.status === 0) { say(`launcher 就绪`); return { ok: true, detail: tail }; }
+      return { ok: false, detail: r.error ? `${r.error.message}\n${tail}` : `exit ${r.status}\n${tail}` };
+    },
+    waitHubOnline: async () => {
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`${hub}/api/status`, { headers: { Authorization: `Bearer ${profile.token || gc.token}` } });
+          if (res.ok) {
+            const body: any = await res.json();
+            const row = (body?.sessions ?? []).find((x: any) => x?.alias === displayName);
+            if (row && ["idle", "working"].includes(String(row.status))) return { ok: true, detail: `hub reports ${row.status}` };
+          }
+        } catch { /* retry */ }
+        await sleep(2000);
+      }
+      return { ok: false, detail: "hub did not report the node idle/working within 60s" };
+    },
+    nonceProbe: peer ? async () => {
+      const nonce = `anet-lc-${randomBytes(6).toString("hex")}`;
+      const peerTok = (peer.profile as any).token as string;
+      const peerAlias = nodeDisplayName(peer.id, peer.profile);
+      const headers = { Authorization: `Bearer ${peerTok}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-03-26" };
+      const body = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "send_task", arguments: { alias: displayName, task: `[anet lifecycle probe] 请只回复这一串,不做其他事: ${nonce}`, priority: "high" } } };
+      try {
+        const res = await fetch(`${hub}/mcp`, { method: "POST", headers, body: JSON.stringify(body) });
+        if (!res.ok) return { ok: false, detail: `probe send_task from ${peerAlias} failed: HTTP ${res.status}` };
+      } catch (e: any) { return { ok: false, detail: `probe send_task from ${peerAlias} failed: ${e?.message ?? e}` }; }
+      say(`nonce probe sent from ${peerAlias}; waiting for ${displayName} to answer (≤150s)`);
+      const deadline = Date.now() + 150_000;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`${hub}/api/messages?limit=50`, { headers: { Authorization: `Bearer ${peerTok}` } });
+          if (res.ok) {
+            const rows: any[] = ((await res.json()) as any)?.messages ?? [];
+            const hit = rows.find((m) => typeof m?.content === "string" && m.content.includes(nonce) && m.type !== "task");
+            if (hit) {
+              const from = String(hit.from_alias ?? "");
+              if (from === displayName) return { ok: true, detail: `${peerAlias} received the nonce back from ${displayName} (hub-attributed sender)`, evidence: { nonce, peer: peerAlias, messageId: hit.id ?? null } };
+              return { ok: false, detail: `nonce came back from "${from}", not ${displayName}`, evidence: { nonce, peer: peerAlias, from } };
+            }
+          }
+        } catch { /* retry */ }
+        await sleep(3000);
+      }
+      return { ok: false, detail: `no reply carrying the nonce reached ${peerAlias} within 150s`, evidence: { nonce, peer: peerAlias } };
+    } : undefined,
+  };
+  const outcome = await runCodexRestart(verb as "start" | "restart" | "resume", actions);
+  const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks: outcome.checks });
   const path = writeReceipt(nodeDir, receipt);
-  if (opts.json === "true") console.log(JSON.stringify({ ...receipt, receiptPath: path }, null, 2));
-  else { console.log(formatReceiptSummary(receipt)); console.log(`receipt: ${path}`); }
+  if (opts.json === "true") console.log(JSON.stringify({ ...receipt, stoppedAt: outcome.stoppedAt, rolledBack: outcome.rolledBack, receiptPath: path }, null, 2));
+  else {
+    console.log(formatReceiptSummary(receipt));
+    console.log(`stopped at: ${outcome.stoppedAt}${outcome.rolledBack ? " (rolled back)" : ""}`);
+    console.log(`receipt: ${path}`);
+  }
   process.exit(receipt.verdict === "PASS" ? 0 : 2);
 }
 

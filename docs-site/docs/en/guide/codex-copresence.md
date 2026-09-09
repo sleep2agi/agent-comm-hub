@@ -146,6 +146,20 @@ anet node codex preflight <alias>          # read-only checks, exit 0 = PASS / e
 anet node codex verify    <alias> --json   # preflight + child-process environment + cross-node identity attestation; JSON for automation
 ```
 
+### restart / start / resume: a deterministic state machine, zero LLM calls
+
+```bash
+anet node codex restart <alias> --probe-from <another local node>   # stop Bridge→TUI→App Server, relaunch, re-verify
+anet node codex start   <alias> --probe-from <peer>                  # only when none of the three is alive; otherwise use restart
+anet node codex resume  <alias> --thread <36-char thread id> --probe-from <peer>
+```
+
+Every step of `restart` runs in a fixed order with no reasoning: **preflight (before)** — any fail means no process is touched → read the **goal state** (unreadable or unknown schema = unknown → STOP) → stop in reverse dependency order **Bridge → TUI → App Server** (cut the task inlet first, let the TUI flush its rollout, release the port last) → wait for the rollout byte count to settle (large sessions flush slowly) → wait for the port to free (a holder is only sent a targeted TERM when it is verified to be this node's own leftover app-server; a foreign pid is a FAIL and is never touched) → hand over to the launcher, `anet node start --copresence --tui-first` (**App Server → port ready → exact-session TUI fully restored → Bridge**, so no task can land on a session the human cannot see yet) → **verify (after)**: every preflight item + child-process environment + rollout before/after comparison (same file, bytes may only grow) + goal file unchanged + hub back online + cross-node nonce attestation. A failed launch is rolled back once (relaunch with the original config); if that fails too the node stays stopped and the receipt records the step.
+
+`--probe-from <peer>` makes another local node send the target a task carrying a random nonce through the hub; `identity_attested` passes only when the reply reaches the peer's inbox with the hub-attributed sender equal to the target alias. Without a peer the item is unknown and the verdict is **FAIL** on purpose — "probably it" is not accepted. `resume --thread` takes a full 36-character id only, and only writes it to the config when exactly one rollout for that id exists under this node's CODEX_HOME: no prefixes, no "latest" guessing.
+
+`--json` prints the whole receipt (with `stoppedAt` / `rolledBack`) for the Dashboard health-check button.
+
 What `preflight` checks (each pass / fail / unknown; **anything but pass fails the whole receipt** — no partial success): the alias maps exactly to the `node_id` the hub roster holds; the node's own `CODEX_HOME` is 0700, `auth.json` 0600, and the CommHub token fingerprint matches; the working directory agrees across the config, the TUI process cwd, the TUI `-C` argument and the Bridge process; `codexThreadId` is a full 36-character id with exactly one rollout in that `CODEX_HOME` (absolute path, inode, bytes and mtime are recorded; prefixes or "the newest file" are refused); the app-server port is held by this node's own process (anything else is a foreign PID and is never touched); all three tmux segments (app-server / TUI / bridge) are running and their child processes carry this node's identity marker.
 
 Receipts are written to `.anet/nodes/<id>/receipts/<id>.json` (0600): credentials appear only as irreversible short fingerprints, never in receipts, logs or arguments. Until the cross-node nonce probe lands, `verify` reports `identity_attested` as unknown and therefore always FAILs — by design. start / restart / resume / fork / account / rollback follow in batches; the contract lives in repository issue #1856.
