@@ -160,6 +160,17 @@ Every step of `restart` runs in a fixed order with no reasoning: **preflight (be
 
 `--json` prints the whole receipt (with `stoppedAt` / `rolledBack`) for the Dashboard health-check button.
 
+### fork: inherit the history, renew everything else
+
+```bash
+anet node codex fork <source> --name <target> --workdir <dir> [--inherit-full-access]
+cd <dir> && anet node codex start <target> --probe-from <source>      # first start = verify + nonce attestation
+```
+
+`fork` only reads the source node (its auth.json / config.toml and **that one** rollout) and builds a brand-new node under `<dir>/.anet/nodes/<target>/`: a new `node_id` and CommHub identity, a new `CODEX_HOME` (0700, auth.json 0600), a new thread id (UUIDv7), a new workdir and new tmux names; the port is assigned at first start. The rollout is **streamed and copied with every thread id rewritten** (fixed 36 characters, so the byte count is unchanged), never shared; the first line must be the source thread's `session_meta`, otherwise not a single byte is written. The source's `.anet-copresence.env` (its CommHub token), history, sqlite files and caches are never copied; full access is not inherited unless you pass `--inherit-full-access` and the source already has it.
+
+The receipt's `fork_isolation` requires identity / HOME / thread / rollout file / tmux names to all differ, a byte-equal rollout copy and no token file in the target HOME; `identity_attested` stays unknown at fork time (non-blocking) and is closed by the first `start --probe-from`. `start` / `restart` / `resume` must be run from the directory recorded in `config.codexProjectDir`, otherwise they refuse (the three tmux sessions' cwd and `.anet/nodes` are both relative to the current directory).
+
 What `preflight` checks (each pass / fail / unknown; **anything but pass fails the whole receipt** — no partial success): the alias maps exactly to the `node_id` the hub roster holds; the node's own `CODEX_HOME` is 0700, `auth.json` 0600, and the CommHub token fingerprint matches; the working directory agrees across the config, the TUI process cwd, the TUI `-C` argument and the Bridge process; `codexThreadId` is a full 36-character id with exactly one rollout in that `CODEX_HOME` (absolute path, inode, bytes and mtime are recorded; prefixes or "the newest file" are refused); the app-server port is held by this node's own process (anything else is a foreign PID and is never touched); all three tmux segments (app-server / TUI / bridge) are running and their child processes carry this node's identity marker.
 
 Receipts are written to `.anet/nodes/<id>/receipts/<id>.json` (0600): credentials appear only as irreversible short fingerprints, never in receipts, logs or arguments. Until the cross-node nonce probe lands, `verify` reports `identity_attested` as unknown and therefore always FAILs — by design. start / restart / resume / fork / account / rollback follow in batches; the contract lives in repository issue #1856.

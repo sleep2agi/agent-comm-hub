@@ -35,8 +35,9 @@ import {
   type SessionInfo,
   readMarker,
 } from "../src/copresence-identity";
-import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb } from "../src/codex-lifecycle-receipt";
-import { evaluateCodexPreflight, evaluateCodexVerify } from "../src/codex-lifecycle-preflight";
+import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb, type ReceiptCheck } from "../src/codex-lifecycle-receipt";
+import { evaluateCodexPreflight, evaluateCodexVerify, checkIdentity, checkHome, checkSession } from "../src/codex-lifecycle-preflight";
+import { FORK_HOME_COPY, checkForkIsolation, forkRolloutPath, rewriteRollout, uuidV7 } from "../src/codex-lifecycle-fork";
 import { gatherCodexFacts, realPrimitives, findRollouts, processFact, goalsFileState } from "../src/codex-lifecycle-facts";
 import { runCodexRestart, type RestartActions, type GoalState as LifecycleGoalState } from "../src/codex-lifecycle-restart";
 import { alreadyRunningMessage, runningNodePid } from "../src/node-running-guard";
@@ -2167,6 +2168,8 @@ interface Profile {
   // A full-access grant that was made explicitly once. Never inferred from
   // flags.sandboxMode — see src/codex-copresence-profile.ts.
   codexCopresenceFullAccess?: boolean;
+  /** #1856 — 共存节点的工作目录(= 含 .anet 的目录;fork --workdir 写入;lifecycle 命令核对四处一致)。 */
+  codexProjectDir?: string;
   opencodeMode?: "headless" | "copresence";
   model?: string;
   channels: string[];
@@ -3893,7 +3896,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
-  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume (#1856)
+  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume|fork (#1856)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -7448,23 +7451,26 @@ async function codexLifecycleCommand() {
   const ref = args[2];
   const opts = parseOpts();
   const usage = () => {
-    console.error("Usage: anet node codex <preflight|verify|start|restart|resume> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
+    console.error("Usage: anet node codex <preflight|verify|start|restart|resume|fork> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
     console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
     console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
     console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
     console.error("  restart    确定性状态机(零 LLM):preflight → goal 状态 → 停 Bridge→TUI→App Server → 端口放掉 → 起(App Server→端口→exact TUI→Bridge)→ verify");
     console.error("             --probe-from <peer>  用另一本地节点发 nonce 探针做跨节点身份验收(identity_attested;不给则 unknown → FAIL)");
     console.error("  start      同 restart 但要求三段都不在;resume --thread <id> 先把 exact thread 写进 config(要求唯一 rollout)再 start");
-    console.error("  fork / account / rollback:见 #1856,PR-C..E");
+    console.error("  fork       fork <source> --name <target> --workdir <dir> [--inherit-full-access]:继承历史,其余全新(node_id/CODEX_HOME/thread/端口/tmux 名);");
+    console.error("             rollout 复制并改写 id,源节点零触碰;之后在 <dir> 里 anet node codex start <target> --probe-from <source>");
+    console.error("  account / rollback:见 #1856,PR-D..E");
   };
-  const landed = ["preflight", "verify", "start", "restart", "resume"];
+  const landed = ["preflight", "verify", "start", "restart", "resume", "fork"];
   if (!verb || !ref || !landed.includes(verb)) {
-    if (verb && ["fork", "account", "rollback"].includes(verb)) {
-      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-C..E).`);
+    if (verb && ["account", "rollback"].includes(verb)) {
+      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-D..E).`);
       process.exit(2);
     }
     usage(); process.exit(verb ? 2 : 0);
   }
+  if (verb === "fork") { await codexForkCommand(ref, opts); return; }
   const resolved = resolveNodeRef(ref);
   if (!resolved) { console.error(`[anet] node codex ${verb}: unknown node "${ref}" (anet node ls)`); process.exit(2); }
   const profile = resolved.profile as Record<string, any>;
@@ -7474,6 +7480,15 @@ async function codexLifecycleCommand() {
   }
   const displayName = nodeDisplayName(resolved.id, resolved.profile);
   const nodeDir = join(nodesDir(), resolved.id);
+  if (["start", "restart", "resume"].includes(verb) && profile.codexProjectDir) {
+    // 启动器用 cwd 当三段 tmux 的工作目录,而 .anet/nodes 也是 cwd 相对的:不在 config 记的目录里起,workdir_consistent 必 fail。
+    let here = process.cwd(); try { here = realpathSync(here); } catch { /* keep */ }
+    let want = String(profile.codexProjectDir); try { want = realpathSync(want); } catch { /* keep */ }
+    if (here !== want) {
+      console.error(`[anet] node codex ${verb}: run this from the node's workdir (config.codexProjectDir): cd ${shellQuote(want)}`);
+      process.exit(2);
+    }
+  }
   const marker = readMarker(nodesDir(), resolved.id);
   const recorded = marker.kind === "ok"
     ? { appsrv: marker.marker.sessions.appsrv?.pid ?? null, bridge: marker.marker.sessions.bridge?.pid ?? null, tui: marker.marker.sessions.tui?.pid ?? null }
@@ -7660,6 +7675,145 @@ async function codexLifecycleCommand() {
     console.log(`receipt: ${path}`);
   }
   process.exit(receipt.verdict === "PASS" ? 0 : 2);
+}
+
+// ── #1856 PR-C —— anet node codex fork <source> --name <target> --workdir <dir> ──
+async function codexForkCommand(sourceRef: string, opts: Record<string, string>) {
+  const json = opts.json === "true";
+  const target = String(opts.name ?? "");
+  const workdirRaw = String(opts.workdir ?? "");
+  if (!target || !workdirRaw) {
+    console.error("Usage: anet node codex fork <source> --name <target> --workdir <dir> [--inherit-full-access] [--json]");
+    process.exit(2);
+  }
+  validateNodeName(target);
+  if (!existsSync(workdirRaw) || !statSync(workdirRaw).isDirectory()) {
+    console.error(`[anet] node codex fork: --workdir ${workdirRaw} is not an existing directory (fork does not create it)`);
+    process.exit(2);
+  }
+  const workdir = realpathSync(workdirRaw);
+  const source = resolveNodeRef(sourceRef);
+  if (!source) { console.error(`[anet] node codex fork: unknown source node "${sourceRef}" (anet node ls)`); process.exit(2); }
+  if (normalizeRuntime(source.profile) !== "codex-app-server") {
+    console.error(`[anet] node codex fork: ${source.id} runs ${normalizeRuntime(source.profile)}, not codex-app-server`);
+    process.exit(2);
+  }
+  const sp = source.profile as Record<string, any>;
+  const sourceName = nodeDisplayName(source.id, source.profile);
+  if (sourceName === target) { console.error(`[anet] node codex fork: --name must differ from the source alias`); process.exit(2); }
+  const sourceDir = join(nodesDir(), source.id);
+  const sourceHome = join(sourceDir, "codex-home");
+  const targetNodesDir = join(workdir, ".anet", "nodes");
+  if (existsSync(join(targetNodesDir, target))) {
+    console.error(`[anet] node codex fork: ${join(targetNodesDir, target)} already exists — refusing to overwrite`);
+    process.exit(2);
+  }
+  const say = (m: string) => { if (!json) console.log(`[anet] codex fork: ${m}`); };
+  const startedAt = new Date();
+  const gc = loadGlobal();
+  const hub: string = sp.hub || gc.hub;
+  const prim = realPrimitives({ hub, token: sp.token || gc.token, networkId: sp.network_id || gc.network_id });
+  const smarker = readMarker(nodesDir(), source.id);
+  const sfacts = await gatherCodexFacts(prim, {
+    alias: sourceName,
+    nodeId: sp.node_id ?? null,
+    nodeDir: sourceDir,
+    codexHome: sourceHome,
+    configToken: sp.token ?? null,
+    codexProjectDir: sp.codexProjectDir ?? null,
+    codexThreadId: sp.codexThreadId ?? null,
+    codexAppServerUrl: sp.codexAppServerUrl ?? null,
+    sessions: copresenceTmuxSessions(sourceName),
+    recordedPids: smarker.kind === "ok"
+      ? { appsrv: smarker.marker.sessions.appsrv?.pid ?? null, bridge: smarker.marker.sessions.bridge?.pid ?? null, tui: smarker.marker.sessions.tui?.pid ?? null }
+      : { appsrv: null, bridge: null, tui: null },
+    markerUuid: smarker.kind === "ok" ? smarker.marker.marker : null,
+  });
+  const schecks = evaluateCodexPreflight(sfacts);
+  const checks: ReceiptCheck[] = schecks.map((c) => ({ ...c, key: `source:${c.key}` }));
+  const finish = (dir: string, nodeId: string | null, extra: ReceiptCheck[], next?: string): never => {
+    const receipt = buildReceipt({ verb: "fork", alias: target, nodeId, startedAt, checks: [...checks, ...extra] });
+    const path = writeReceipt(dir, receipt);
+    if (json) console.log(JSON.stringify({ ...receipt, source: sourceName, workdir, receiptPath: path }, null, 2));
+    else { console.log(formatReceiptSummary(receipt)); if (next) console.log(next); console.log(`receipt: ${path}`); }
+    process.exit(receipt.verdict === "PASS" ? 0 : 2);
+  };
+  // 源节点只要求四项 pass:身份、HOME、exact thread + 唯一 rollout、rollout 快照。它自己的 workdir/端口/拓扑缺口不影响 fork。
+  const mustPass = ["identity_match", "home_isolated", "session_exact", "rollout_intact"];
+  const blocked = schecks.filter((c) => mustPass.includes(c.key) && c.status !== "pass");
+  if (blocked.length > 0) {
+    finish(sourceDir, null, [{ key: "fork_isolation", status: "fail", detail: `source not forkable: ${blocked.map((c) => `${c.key}=${c.status}`).join(", ")}` }]);
+  }
+  const srcRollout = sfacts.session.rolloutMatches[0];
+  say(`source ${sourceName}: thread ${sp.codexThreadId}, rollout ${srcRollout.bytes} B`);
+
+  // 新身份先在 hub 上登记(拿 ntok),再动磁盘;磁盘先写 staging,最后一步 rename 进位。
+  process.chdir(workdir);
+  const createOpts = { ...opts, runtime: "codex-app-server", copresence: "true", hub: sp.hub ?? opts.hub, model: opts.model ?? sp.model } as unknown as ReturnType<typeof parseOpts>;
+  delete (createOpts as any).name; delete (createOpts as any).workdir; delete (createOpts as any).json; delete (createOpts as any)["inherit-full-access"];
+  createOpts._channels = createOpts._channels ?? []; createOpts._envs = createOpts._envs ?? [];
+  const base = createProfileFromOpts(target, createOpts);
+  const newThread = uuidV7(Date.now(), randomBytes(10));
+  const inheritFull = opts["inherit-full-access"] === "true" && sp.codexCopresenceFullAccess === true;
+  const draft: Profile = { ...base, codexCopresence: true, codexThreadId: newThread, codexProjectDir: workdir, ...(inheritFull ? { codexCopresenceFullAccess: true } : {}) };
+  const withTok = await ensureNodeToken(draft, target);
+  say(`hub identity for ${target}: node_id ${withTok.node_id}`);
+  const staging = join(targetNodesDir, `.fork-${target}-${process.pid}`);
+  const stagingHome = join(staging, "codex-home");
+  let rewrite: Awaited<ReturnType<typeof rewriteRollout>> | null = null;
+  try {
+    mkdirSync(stagingHome, { recursive: true, mode: 0o700 });
+    chmodSync(stagingHome, 0o700);
+    for (const f of FORK_HOME_COPY) {
+      const from = join(sourceHome, f.name);
+      if (!existsSync(from)) { if (f.required) throw new Error(`${f.name} missing in source CODEX_HOME`); continue; }
+      copyFileSync(from, join(stagingHome, f.name));
+      chmodSync(join(stagingHome, f.name), f.mode);
+    }
+    const dst = forkRolloutPath(stagingHome, startedAt, newThread);
+    rewrite = await rewriteRollout(srcRollout.path, dst, String(sp.codexThreadId), newThread);
+    say(`rollout copied: ${rewrite.lines} lines, ${rewrite.bytesOut} B, ${rewrite.replacements} id rewrites → ${dst}`);
+    saveProfile(target, withTok);
+    renameSync(stagingHome, join(targetNodesDir, target, "codex-home"));
+    rmSync(staging, { recursive: true, force: true });
+  } catch (e: any) {
+    rmSync(staging, { recursive: true, force: true });
+    console.error(`[anet] node codex fork: ❌ ${e?.message ?? e}`);
+    console.error(`[anet]    nothing was moved into ${join(targetNodesDir, target)}; the hub may hold a registration for "${target}" — anet node delete ${shellQuote(target)} cleans it.`);
+    finish(sourceDir, withTok.node_id ?? null, [{ key: "fork_isolation", status: "fail", detail: `staging failed: ${e?.message ?? e}` }]);
+  }
+
+  // 目标侧核对(nodesDir 现在指向 workdir/.anet/nodes)。
+  const targetDir = join(nodesDir(), target);
+  const targetHome = join(targetDir, "codex-home");
+  const tprim = realPrimitives({ hub, token: withTok.token || gc.token, networkId: (withTok as any).network_id || gc.network_id });
+  const tfacts = await gatherCodexFacts(tprim, {
+    alias: target,
+    nodeId: withTok.node_id ?? null,
+    nodeDir: targetDir,
+    codexHome: targetHome,
+    configToken: withTok.token ?? null,
+    codexProjectDir: workdir,
+    codexThreadId: newThread,
+    codexAppServerUrl: null,
+    sessions: copresenceTmuxSessions(target),
+    recordedPids: { appsrv: null, bridge: null, tui: null },
+    markerUuid: null,
+  });
+  const targetRollout = tfacts.session.rolloutMatches.length === 1 ? tfacts.session.rolloutMatches[0] : null;
+  const isolation = checkForkIsolation({
+    source: { nodeId: sp.node_id ?? null, homeReal: sfacts.home.dir, threadId: sp.codexThreadId ?? null, alias: sourceName, rolloutInode: srcRollout.inode, rolloutBytes: srcRollout.bytes },
+    target: { nodeId: withTok.node_id ?? null, homeReal: tfacts.home.dir, threadId: newThread, alias: target, rolloutInode: targetRollout?.inode ?? null, rolloutBytes: targetRollout?.bytes ?? null, envFilePresent: existsSync(join(targetHome, ".anet-copresence.env")) },
+    rewrite,
+  });
+  const workdirCheck: ReceiptCheck = tfacts.workdir.configProjectDir === workdir
+    ? { key: "workdir_consistent", status: "pass", detail: `config.codexProjectDir=${workdir} (config only — live cwd/bridge are checked at first start)`, evidence: { config: workdir } }
+    : { key: "workdir_consistent", status: "fail", detail: `config.codexProjectDir=${tfacts.workdir.configProjectDir} ≠ ${workdir}` };
+  const next = `next (run from ${workdir}):\n  anet node codex start ${shellQuote(target)} --probe-from ${shellQuote(sourceName)}   # first start = verify + nonce attestation`;
+  finish(targetDir, withTok.node_id ?? null, [
+    checkIdentity(tfacts), checkHome(tfacts), checkSession(tfacts), workdirCheck, isolation,
+    { key: "identity_attested", status: "unknown", detail: `not started yet — ${next.split("\n")[1].trim()}` },
+  ], next);
 }
 
 async function resumeCommand() {
