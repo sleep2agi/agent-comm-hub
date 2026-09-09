@@ -136,6 +136,19 @@ tmux capture-pane -t =<alias> -p | grep "Allow the commhub MCP"
 实测（2026-07-31）：新建 TUI 的节点复现；同宿主既有共存节点未受影响（它们的 app-server 启动时带了 `approval_policy=never`）。**所以这是「新建 TUI 时」的坑，不是存量问题。**
 :::
 
+## 生命周期命令：`anet node codex …`(只读核对先落地)
+
+重启 / 恢复共存节点以前靠人肉 runbook(见「Codex TUI 节点安全重启」);现在把每一步「核什么」做成确定性的 CLI,正常流程不调用任何 LLM,只出机器可读 receipt。第一批两个只读命令:
+
+```bash
+anet node codex preflight <alias>          # 只读核对,exit 0 = PASS / exit 2 = FAIL
+anet node codex verify    <alias> --json   # preflight + 子进程环境核对 + 跨节点身份验收;JSON 供自动化消费
+```
+
+`preflight` 核的项(每项 pass / fail / unknown,**任一非 pass 整体 FAIL**,不许部分成功):alias 与 hub 名册里的 `node_id` 精确匹配;节点自己的 `CODEX_HOME` 0700、`auth.json` 0600、CommHub token 指纹一致;工作目录在 config、TUI 进程 cwd、TUI `-C`、Bridge 进程四处一致;`codexThreadId` 是完整 36 位且 `CODEX_HOME` 里恰有一个对应 rollout(记下绝对路径、inode、字节数、mtime;不接受前缀或「最近的文件」);app-server 端口的占用者确实是本节点的进程(否则视为 foreign PID,不会去动它);tmux 三段(app-server / TUI / bridge)都在跑且子进程都带本节点的身份 marker。
+
+receipt 写在 `.anet/nodes/<id>/receipts/<id>.json`(0600):凭据只记不可逆短指纹,token 不会出现在 receipt、日志或参数里。`verify` 在跨节点 nonce 探针落地前 `identity_attested` 恒为 unknown,因此恒 FAIL —— 这是有意的。start / restart / resume / fork / account / rollback 分批落地,合同见仓库 issue #1856。
+
 ## 权限：默认只读，完整访问必须双重确认
 
 共存默认使用 `sandbox_mode=read-only` 与按需审批。需要 Codex 写文件、跑完整网络/命令工具时，必须显式选择：
