@@ -3867,6 +3867,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
+  anet node codex <preflight|verify> <name>  Codex TUI co-presence lifecycle checks (#1856; receipts, fail-closed)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -16657,7 +16658,7 @@ if (args.slice(1).some((a) => a === "--help" || a === "-h")) {
         await nodeLoopCommand();
         process.exit(0);
       } else {
-        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|migrate-token-to-envref> [name]`);
+        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|migrate-token-to-envref> [name]`);
       }
       break;
     default:
@@ -16704,11 +16705,11 @@ switch (command) {
           const redirect = nodeSubcommandRedirect(sub, args[2]);
           if (redirect) { for (const line of redirect) console.log(line); }
           else {
-            const suggestion = suggestSimilar(sub, ["create", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop"]);
+            const suggestion = suggestSimilar(sub, ["create", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex"]);
             if (suggestion) console.log(`Unknown node subcommand "${sub}". Did you mean: anet node ${suggestion}?`);
           }
         }
-        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|migrate-token-to-envref> [name]`);
+        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|migrate-token-to-envref> [name]`);
         break;
       }
     }
