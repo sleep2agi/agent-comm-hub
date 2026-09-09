@@ -33,7 +33,11 @@ import {
   prepareIdentityForStart,
   anchorsFromMarker,
   type SessionInfo,
+  readMarker,
 } from "../src/copresence-identity";
+import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb } from "../src/codex-lifecycle-receipt";
+import { evaluateCodexPreflight, evaluateCodexVerify } from "../src/codex-lifecycle-preflight";
+import { gatherCodexFacts, realPrimitives } from "../src/codex-lifecycle-facts";
 import { alreadyRunningMessage, runningNodePid } from "../src/node-running-guard";
 import { assertTmuxSupportsSessionEnv } from "../src/tmux-capability";
 import { classifySessionStatus, summarizeSessions } from "../src/session-status-class";
@@ -3863,6 +3867,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
+  anet node codex <verb> <ref>  Codex TUI co-presence checks: preflight|verify (#1856)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -7405,6 +7410,65 @@ async function startCommand() {
 }
 
 // ── resume (continue session) ──
+
+// ── #1856 —— anet node codex <verb> <alias>:Codex TUI 共存节点生命周期控制器 ──
+// PR-A:preflight / verify(只读,不碰进程、不改文件;只在 <nodeDir>/receipts/ 写 receipt)。
+// start / restart / resume / fork / account / rollback 分 PR 落地;合同与 14 条不变量见 issue #1856。
+async function codexLifecycleCommand() {
+  const verb = args[1] as LifecycleVerb | undefined;
+  const ref = args[2];
+  const opts = parseOpts();
+  const usage = () => {
+    console.error("Usage: anet node codex <preflight|verify> <alias> [--json]");
+    console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
+    console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
+    console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
+    console.error("  start / restart / resume / fork / account / rollback:见 #1856,分 PR 落地");
+  };
+  if (!verb || !ref || !["preflight", "verify"].includes(verb)) {
+    if (verb && !["preflight", "verify"].includes(verb) && ["start", "restart", "resume", "fork", "account", "rollback"].includes(verb)) {
+      console.error(`[anet] node codex ${verb}: not landed yet (#1856 PR-B..E). Use \`anet node codex preflight <alias>\` today.`);
+      process.exit(2);
+    }
+    usage(); process.exit(verb ? 2 : 0);
+  }
+  const resolved = resolveNodeRef(ref);
+  if (!resolved) { console.error(`[anet] node codex ${verb}: unknown node "${ref}" (anet node ls)`); process.exit(2); }
+  const profile = resolved.profile as Record<string, any>;
+  if (normalizeRuntime(resolved.profile) !== "codex-app-server") {
+    console.error(`[anet] node codex ${verb}: ${resolved.id} runs ${normalizeRuntime(resolved.profile)}, not codex-app-server`);
+    process.exit(2);
+  }
+  const displayName = nodeDisplayName(resolved.id, resolved.profile);
+  const nodeDir = join(nodesDir(), resolved.id);
+  const marker = readMarker(nodesDir(), resolved.id);
+  const recorded = marker.kind === "ok"
+    ? { appsrv: marker.marker.sessions.appsrv?.pid ?? null, bridge: marker.marker.sessions.bridge?.pid ?? null, tui: marker.marker.sessions.tui?.pid ?? null }
+    : { appsrv: null, bridge: null, tui: null };
+  const gc = loadGlobal();
+  const startedAt = new Date();
+  const facts = await gatherCodexFacts(realPrimitives({ hub: profile.hub || gc.hub, token: profile.token || gc.token, networkId: profile.network_id || gc.network_id }), {
+    alias: displayName,
+    nodeId: profile.node_id ?? null,
+    nodeDir,
+    codexHome: join(nodeDir, "codex-home"),
+    configToken: profile.token ?? null,
+    codexProjectDir: profile.codexProjectDir ?? null,
+    codexThreadId: profile.codexThreadId ?? null,
+    codexAppServerUrl: profile.codexAppServerUrl ?? null,
+    sessions: copresenceTmuxSessions(displayName),
+    recordedPids: recorded,
+    markerUuid: marker.kind === "ok" ? marker.marker.marker : null,
+  });
+  const checks = verb === "preflight"
+    ? evaluateCodexPreflight(facts)
+    : evaluateCodexVerify(facts, { key: "identity_attested", status: "unknown", detail: "cross-node nonce probe not landed yet (#1856 PR-B) — verify cannot PASS before it" });
+  const receipt = buildReceipt({ verb, alias: displayName, nodeId: profile.node_id ?? null, startedAt, checks });
+  const path = writeReceipt(nodeDir, receipt);
+  if (opts.json === "true") console.log(JSON.stringify({ ...receipt, receiptPath: path }, null, 2));
+  else { console.log(formatReceiptSummary(receipt)); console.log(`receipt: ${path}`); }
+  process.exit(receipt.verdict === "PASS" ? 0 : 2);
+}
 
 async function resumeCommand() {
   const ref = args[1];
@@ -16594,7 +16658,7 @@ if (args.slice(1).some((a) => a === "--help" || a === "-h")) {
         await nodeLoopCommand();
         process.exit(0);
       } else {
-        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|migrate-token-to-envref> [name]`);
+        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|migrate-token-to-envref> [name]`);
       }
       break;
     default:
@@ -16633,6 +16697,7 @@ switch (command) {
         break;
       }
       case "migrate-token-to-envref": args.splice(0, 1); await migrateTokenToEnvRefCommand(); break;
+      case "codex": args.splice(0, 1); await codexLifecycleCommand(); break; // #1856 —— Codex TUI 共存节点生命周期控制器
       default: {
         const sub = args[1];
         if (sub) {
@@ -16640,11 +16705,11 @@ switch (command) {
           const redirect = nodeSubcommandRedirect(sub, args[2]);
           if (redirect) { for (const line of redirect) console.log(line); }
           else {
-            const suggestion = suggestSimilar(sub, ["create", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop"]);
+            const suggestion = suggestSimilar(sub, ["create", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex"]);
             if (suggestion) console.log(`Unknown node subcommand "${sub}". Did you mean: anet node ${suggestion}?`);
           }
         }
-        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|migrate-token-to-envref> [name]`);
+        console.log(`Usage: anet node <create|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|migrate-token-to-envref> [name]`);
         break;
       }
     }

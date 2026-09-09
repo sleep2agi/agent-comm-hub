@@ -137,6 +137,19 @@ tmux capture-pane -t =<alias> -p | grep "Allow the commhub MCP"
 Measured 2026-07-31: reproduced on a freshly created TUI; pre-existing co-presence nodes on the same host were unaffected because their app-servers were started with `approval_policy=never`. **This is a new-TUI hazard, not a latent fleet problem.**
 :::
 
+## Lifecycle commands: `anet node codex …` (read-only checks land first)
+
+Restarting or resuming a co-presence node used to be a manual runbook ("Codex TUI safe restart"). Every check in it is becoming a deterministic CLI step: no LLM on the happy path, machine-readable receipts only. The first two commands are read-only:
+
+```bash
+anet node codex preflight <alias>          # read-only checks, exit 0 = PASS / exit 2 = FAIL
+anet node codex verify    <alias> --json   # preflight + child-process environment + cross-node identity attestation; JSON for automation
+```
+
+What `preflight` checks (each pass / fail / unknown; **anything but pass fails the whole receipt** — no partial success): the alias maps exactly to the `node_id` the hub roster holds; the node's own `CODEX_HOME` is 0700, `auth.json` 0600, and the CommHub token fingerprint matches; the working directory agrees across the config, the TUI process cwd, the TUI `-C` argument and the Bridge process; `codexThreadId` is a full 36-character id with exactly one rollout in that `CODEX_HOME` (absolute path, inode, bytes and mtime are recorded; prefixes or "the newest file" are refused); the app-server port is held by this node's own process (anything else is a foreign PID and is never touched); all three tmux segments (app-server / TUI / bridge) are running and their child processes carry this node's identity marker.
+
+Receipts are written to `.anet/nodes/<id>/receipts/<id>.json` (0600): credentials appear only as irreversible short fingerprints, never in receipts, logs or arguments. Until the cross-node nonce probe lands, `verify` reports `identity_attested` as unknown and therefore always FAILs — by design. start / restart / resume / fork / account / rollback follow in batches; the contract lives in repository issue #1856.
+
 ## Permissions: read-only by default, explicit double opt-in for full access
 
 Co-presence defaults to `sandbox_mode=read-only` with on-request approvals. If Codex must write files or use unrestricted command/network tools, opt in explicitly:

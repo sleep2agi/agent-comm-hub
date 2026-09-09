@@ -24,7 +24,7 @@ describe("#1698 anet node edit —— 接线", () => {
     expect(cli).toContain('case "edit": args.splice(0, 1); await nodeEditCommand(); break;');
   });
   test("两条用法行都列了 edit（同一串出现两次，漏一处就不一致）", () => {
-    const m = cli.match(/anet node <create\|start\|stop\|restart\|resume\|delete\|ls\|rename\|edit\|loop\|migrate-token-to-envref>/g);
+    const m = cli.match(/anet node <create\|start\|stop\|restart\|resume\|delete\|ls\|rename\|edit\|loop\|codex\|migrate-token-to-envref>/g);
     expect(m?.length).toBe(2);
   });
   test("用现成件解析节点与读写配置，不自己拼路径", () => {
