@@ -172,6 +172,20 @@ export interface GatherInput {
   markerUuid: string | null;
 }
 
+/** ⑨ goals.json → 状态摘要 + 内容指纹。没有文件 = none(没派过目标);有文件但 schema 不认识/读不到 = unknown(restart 必须 STOP)。 */
+export function goalsFileState(nodeDir: string): { state: "active" | "stalled" | "paused" | "achieved" | "none" | "unknown"; fingerprint: string | null } {
+  const gp = join(nodeDir, "goals.json");
+  if (!existsSync(gp)) return { state: "none", fingerprint: null };
+  try {
+    const raw = readFileSync(gp, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.goals)) return { state: "unknown", fingerprint: null };
+    const statuses = new Set<string>(parsed.goals.map((g: any) => String(g?.status ?? "")));
+    const state = statuses.has("active") ? "active" : statuses.has("stalled") ? "stalled" : statuses.has("paused") ? "paused" : statuses.has("achieved") ? "achieved" : "none";
+    return { state, fingerprint: shortFingerprint(raw, 16) };
+  } catch { return { state: "unknown", fingerprint: null }; }
+}
+
 export async function gatherCodexFacts(prim: FactPrimitives, input: GatherInput): Promise<PreflightFacts> {
   const configTokenFingerprint = shortFingerprint(input.configToken);
   const live = {
@@ -215,7 +229,7 @@ export async function gatherCodexFacts(prim: FactPrimitives, input: GatherInput)
       liveMarkers: { appsrv: appsrvTree.map((p) => p.markerUuid), bridge: bridgeTree.map((p) => p.markerUuid), tui: tuiTree.map((p) => p.markerUuid) },
       liveHomes: { appsrv: appsrvTree.map((p) => p.codexHome), bridge: bridgeTree.map((p) => p.codexHome), tui: tuiTree.map((p) => p.codexHome) },
     },
-    goal: { state: "unknown" },
+    goal: { state: goalsFileState(input.nodeDir).state },
     children,
     expectedTokenFingerprint: configTokenFingerprint,
   };
