@@ -166,3 +166,14 @@ describe("receipt hygiene", () => {
     expect(redactReceipt("Bearer abc")).toBe("[REDACTED]");
   });
 });
+
+describe("#1856 PR-C workdir: TUI -C is optional evidence (launcher never passes it)", () => {
+  test("config + tui.cwd + bridge agree, -C and status bar unreadable → pass", () => {
+    const f = { ...good(), workdir: { configProjectDir: "/w", tuiCwd: "/w", tuiArgvDir: null, bridgeProjectDir: "/w", statusBarDir: null } } as any;
+    expect(checkWorkdir(f).status).toBe("pass");
+  });
+  test("-C readable but different → still fail; tui.cwd unreadable → unknown", () => {
+    expect(checkWorkdir({ ...good(), workdir: { configProjectDir: "/w", tuiCwd: "/w", tuiArgvDir: "/x", bridgeProjectDir: "/w", statusBarDir: null } } as any).status).toBe("fail");
+    expect(checkWorkdir({ ...good(), workdir: { configProjectDir: "/w", tuiCwd: null, tuiArgvDir: null, bridgeProjectDir: "/w", statusBarDir: null } } as any).status).toBe("unknown");
+  });
+});

@@ -95,15 +95,16 @@ export function checkHome(f: PreflightFacts): ReceiptCheck {
 export function checkWorkdir(f: PreflightFacts): ReceiptCheck {
   const w = f.workdir;
   if (!w.configProjectDir) return { key: "workdir_consistent", status: "fail", detail: "config.codexProjectDir is missing (run: anet node config apply <alias> <patch.json>)" };
-  // 前四个是承重证据(config / TUI 进程 cwd / TUI argv -C / Bridge 进程的 project_dir);状态栏只能在 pane 上读到
-  // 路径时才当证据 —— 读不到不算 unknown(TUI 状态栏不总显示目录),读到了却不一致照样 fail。
-  const required: Array<[string, string | null]> = [["config", w.configProjectDir], ["tui.cwd", w.tuiCwd], ["tui.-C", w.tuiArgvDir], ["bridge.project_dir", w.bridgeProjectDir]];
-  const all: Array<[string, string | null]> = [...required, ["tui.statusbar", w.statusBarDir]];
+  // 承重证据是 config / TUI 进程 cwd / Bridge 进程的 project_dir 三处。TUI argv 的 -C 与状态栏只在读到路径时才当
+  // 证据 —— 读不到不算 unknown(启动器不传 -C,TUI 状态栏不总显示目录;PR-A 把 -C 当必需,真机上永远 unknown,#1856 PR-C 修),
+  // 读到了却不一致照样 fail。
+  const required: Array<[string, string | null]> = [["config", w.configProjectDir], ["tui.cwd", w.tuiCwd], ["bridge.project_dir", w.bridgeProjectDir]];
+  const all: Array<[string, string | null]> = [...required, ["tui.-C", w.tuiArgvDir], ["tui.statusbar", w.statusBarDir]];
   const mismatched = all.filter(([, v]) => v !== null && v !== w.configProjectDir).map(([k, v]) => `${k}=${v}`);
   if (mismatched.length) return { key: "workdir_consistent", status: "fail", detail: `workdir disagrees: ${mismatched.join(", ")} vs config=${w.configProjectDir}`, evidence: Object.fromEntries(all) };
   const missing = required.filter(([, v]) => v === null).map(([k]) => k);
   if (missing.length) return { key: "workdir_consistent", status: "unknown", detail: `could not read ${missing.join(", ")} (node not running, or not observable on this platform)`, evidence: Object.fromEntries(all) };
-  return { key: "workdir_consistent", status: "pass", detail: `config / tui.cwd / tui.-C / bridge.project_dir agree on ${w.configProjectDir}${w.statusBarDir ? " (status bar too)" : ""}`, evidence: Object.fromEntries(all) };
+  return { key: "workdir_consistent", status: "pass", detail: `config / tui.cwd / bridge.project_dir agree on ${w.configProjectDir}${w.tuiArgvDir ? " (-C too)" : ""}${w.statusBarDir ? " (status bar too)" : ""}`, evidence: Object.fromEntries(all) };
 }
 
 // ④ session 只能用目标 CODEX_HOME 里完整 36 位 thread ID + 唯一 rollout;禁止前缀 / 最近文件猜测。

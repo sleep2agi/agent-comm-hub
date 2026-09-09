@@ -46,7 +46,8 @@ export const REQUIRED_CHECKS: Readonly<Record<LifecycleVerb, readonly string[]>>
   start: ["identity_match", "home_isolated", "workdir_consistent", "session_exact", "start_order", "child_env_attested", "identity_attested"],
   restart: ["identity_match", "home_isolated", "workdir_consistent", "session_exact", "rollout_intact", "goal_state_preserved", "stop_order", "start_order", "child_env_attested", "identity_attested"],
   resume: ["identity_match", "home_isolated", "workdir_consistent", "session_exact", "rollout_intact", "start_order", "child_env_attested", "identity_attested"],
-  fork: ["identity_match", "fork_isolation", "home_isolated", "workdir_consistent", "identity_attested"],
+  // fork 只创建不启动:identity_attested 留给首次 start(--probe-from);目标侧要求 exact thread + 唯一 rollout。
+  fork: ["identity_match", "fork_isolation", "home_isolated", "workdir_consistent", "session_exact"],
   "account-install": ["identity_match", "account_probe", "home_isolated", "identity_attested"],
   rollback: ["identity_match", "rollout_intact"],
 };
@@ -68,6 +69,8 @@ export function redactReceipt<T>(value: T, key = ""): T {
   return value;
 }
 
+export const INFORMATIONAL_PREFIXES: readonly string[] = ["before:", "source:"];
+
 export function receiptVerdict(verb: LifecycleVerb, checks: readonly ReceiptCheck[]): { verdict: "PASS" | "FAIL"; blocking: string[] } {
   const byKey = new Map(checks.map((c) => [c.key, c]));
   const blocking: string[] = [];
@@ -76,7 +79,13 @@ export function receiptVerdict(verb: LifecycleVerb, checks: readonly ReceiptChec
     if (!c || c.status !== "pass") blocking.push(key);
   }
   // 任何额外 check 若 fail 也阻塞(比如 preflight 顺手量到的东西);unknown 的额外项不阻塞,但会留在 checks 里。
-  for (const c of checks) if (c.status === "fail" && !blocking.includes(c.key)) blocking.push(c.key);
+  // 例外:带 INFORMATIONAL_PREFIXES 前缀的是「另一阶段 / 另一个节点」的快照(restart 的 before:、fork 的 source:),
+  // 它们该拦的地方已经在状态机里拦过(before 阶段 fail 根本走不到这里;fork 对源只要求四项),留在 receipt 里只为复核。
+  for (const c of checks) {
+    if (c.status !== "fail" || blocking.includes(c.key)) continue;
+    if (INFORMATIONAL_PREFIXES.some((p) => c.key.startsWith(p))) continue;
+    blocking.push(c.key);
+  }
   return { verdict: blocking.length === 0 ? "PASS" : "FAIL", blocking };
 }
 
