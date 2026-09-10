@@ -94,7 +94,7 @@ export function checkHome(f: PreflightFacts): ReceiptCheck {
 // ③ 工作目录同时匹配 config、进程 cwd、TUI -C、Bridge project_dir、TUI 状态栏。
 export function checkWorkdir(f: PreflightFacts): ReceiptCheck {
   const w = f.workdir;
-  if (!w.configProjectDir) return { key: "workdir_consistent", status: "fail", detail: "config.codexProjectDir is missing (run: anet node config apply <alias> <patch.json>)" };
+  if (!w.configProjectDir) return { key: "workdir_consistent", status: "fail", detail: "config.codexProjectDir is missing (set it: anet node edit <alias> --workdir <dir-that-holds-.anet>)" };
   // 承重证据是 config / TUI 进程 cwd / Bridge 进程的 project_dir 三处。TUI argv 的 -C 与状态栏只在读到路径时才当
   // 证据 —— 读不到不算 unknown(启动器不传 -C,TUI 状态栏不总显示目录;PR-A 把 -C 当必需,真机上永远 unknown,#1856 PR-C 修),
   // 读到了却不一致照样 fail。

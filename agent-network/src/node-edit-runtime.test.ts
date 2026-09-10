@@ -113,3 +113,13 @@ describe("#1698 说清何时生效", () => {
     expect(body).toContain("saveProfile(");
   });
 });
+
+describe("#1856 --workdir:与 --model 同一条路", () => {
+  const body = readFileSync(new URL("../bin/cli.ts", import.meta.url), "utf-8");
+  test("接线 + 空值挡 + 目录校验 + 写 codexProjectDir", () => {
+    expect(body).toContain('args.indexOf("--workdir")');
+    expect(body).toContain("--workdir needs a value");
+    expect(body).toContain("(profile as any).codexProjectDir = nextDir;");
+    expect(body).toContain("[--workdir <dir>]");
+  });
+});

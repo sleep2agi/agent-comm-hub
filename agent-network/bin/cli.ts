@@ -10104,11 +10104,15 @@ async function nodeEditCommand() {
   //    与 #1698 里 grok 撞 uid_map 墙时「产品给出的修法产品自己做不到」同形。
   const modelIdx = args.indexOf("--model");
   const rawModel = modelIdx >= 0 ? args[modelIdx + 1] : undefined;
-  if (!ref || (flagIdx < 0 && modelIdx < 0)) {
+  // #1856 —— `--workdir <dir>` 写 codexProjectDir(共存节点的工作目录 = 含 .anet 的目录);preflight 的
+  // workdir_consistent 缺它就 fail,而在这之前没有任何命令能给旧节点补上(提示里写的 `config apply` 根本不存在)。
+  const workdirIdx = args.indexOf("--workdir");
+  const rawWorkdir = workdirIdx >= 0 ? args[workdirIdx + 1] : undefined;
+  if (!ref || (flagIdx < 0 && modelIdx < 0 && workdirIdx < 0)) {
     console.log(`
-anet node edit <node-id|node-name> [--runtime <id>] [--model <id>]
+anet node edit <node-id|node-name> [--runtime <id>] [--model <id>] [--workdir <dir>]
 
-  Change an existing node's runtime and/or model. Supported runtime ids:
+  Change an existing node's runtime, model and/or co-presence workdir. Supported runtime ids:
     ${SUPPORTED_RUNTIME_NAMES.join(", ")}
 
   --model takes any id the runtime accepts; it is validated the same way
@@ -10129,7 +10133,11 @@ anet node edit <node-id|node-name> [--runtime <id>] [--model <id>]
   if (modelIdx >= 0 && (rawModel === undefined || rawModel.trim() === "" || rawModel.startsWith("--"))) {
     console.error("--model needs a value (an id the runtime accepts).");
     process.exit(1);
+  }  if (workdirIdx >= 0 && (rawWorkdir === undefined || rawWorkdir.trim() === "" || rawWorkdir.startsWith("--"))) {
+    console.error("--workdir needs a value (an existing directory; the one that holds this node's .anet).");
+    process.exit(1);
   }
+
   const resolved = resolveNodeRef(ref);
   if (!resolved) {
     console.error(nodeNotFound(ref));
@@ -10171,6 +10179,21 @@ anet node edit <node-id|node-name> [--runtime <id>] [--model <id>]
     if (currentModel !== nextModel) {
       (profile as any).model = nextModel;
       changes.push(`model ${currentModel ?? "(unset)"} -> ${nextModel}`);
+    }
+  }
+  if (workdirIdx >= 0) {
+    let nextDir: string;
+    try {
+      if (!existsSync(rawWorkdir as string) || !statSync(rawWorkdir as string).isDirectory()) throw new Error(`--workdir ${rawWorkdir}: not an existing directory`);
+      nextDir = realpathSync(rawWorkdir as string);
+    } catch (e: any) {
+      console.error(String(e?.message || e));
+      process.exit(1);
+    }
+    const currentDir = (profile as any).codexProjectDir as string | undefined;
+    if (currentDir !== nextDir) {
+      (profile as any).codexProjectDir = nextDir;
+      changes.push(`workdir ${currentDir ?? "(unset)"} -> ${nextDir}`);
     }
   }
   if (changes.length === 0) {
