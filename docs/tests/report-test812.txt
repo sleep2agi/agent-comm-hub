@@ -1,0 +1,33 @@
+# report-test812 — tmux target semantics
+# docker run --rm --network none anet-t812  (镜像按 SOURCE_COMMIT=287e9b895e487b637aa8e7ffe319c0b264fb2d23 构建)
+# 本文件为套件原样输出,未手工编辑。
+
+# test812 — tmux target semantics, bound to the doc's own commands
+source_commit=287e9b895e487b637aa8e7ffe319c0b264fb2d23
+runsh_blob=9c02fa752a3f73bde3a0fc403a6de934232b6822
+doc_blob=31cf46eb27ca89a561fce6721c11f5d05caa42c9
+tmux=tmux 3.4
+[L0] extract the commands from the doc
+  doc_capture=tmux capture-pane -p -t "=${node}-桥:0" | tail -20
+  doc_listpanes=tmux list-panes -a -F '#{session_name}|#{pane_current_command}' | grep -E '桥\||appsrv'
+  doc_target==${node}-桥:0
+[L1] the doc's target resolves a session that exists
+  rendered==测试-桥:0
+  OK rc=0
+[L2] dropping the window index makes capture-pane fail loudly
+  OK rc=1 msg=can't find pane
+[L3] '=' guards against a stale session that has your target as a prefix
+  loose  -t 'A站狗-桥:0'  rc=0   ← 抓到的是残留的 A站狗-桥-old,不报错
+  exact  -t '=A站狗-桥:0' rc=1 msg=can't find session
+  对照:A站狗2-桥 在场时问 A站狗-桥 → 两种写法都红(= 不是防这个的)
+  glob   -t '甲-*:0' rc=0 / -t '=甲-*:0' rc=1   ← '=' 也关掉 fnmatch
+[L4] the same malformed target fails loudly for capture-pane, silently for display-message
+  display-message -t '=A站狗-桥'   rc=0 out=(空)   ← 静默
+  display-message -t '=A站狗-桥:0' rc=0 out=A站狗-桥
+[L5] list-panes rows are <session>|<cmd>, so a '桥$' anchor misses them
+  rows=甲-appsrv|sleep 甲-桥|sleep
+  OK  '桥\|' 命中,'桥$' 不命中
+[L6] witnessed-red: strip '=' from the doc's own target and the silent-wrong-node bug returns
+  MUTATION_RED doc-target-without-equals target='A站狗-桥:0' rc=0 (静默命中残留的 A站狗-桥-old)
+RESULT: PASS
+exit_code=0
