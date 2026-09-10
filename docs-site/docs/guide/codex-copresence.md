@@ -186,6 +186,14 @@ anet node codex rollback <alias> --receipt <install-receipt-id> --probe-from <pe
 
 `rollback` 只接受原 install receipt 里的 `backup_ref`,不接受调用方另传文件:恢复 → 完整重启 → 指纹回到 receipt 记的 `targetPreviousFingerprint`。
 
+### 批量之前先 canary
+
+```bash
+anet node codex canary 节点A 节点B 节点C --probe-from <peer>     # 逐个 verify,第一个 FAIL 即停
+```
+
+要对一批共存节点做重启或换账号,先跑 `canary`:名单先整体核对(名字打错、不是 codex 节点都直接拒绝,一个不跑),然后**按顺序逐个 `verify`**(给了 `--probe-from` 就带 nonce 验收),第一个 FAIL 处停下,后面的节点一个不碰,汇总里明确标成「not run」。每个节点各留一份 verify receipt;`--json` 输出汇总(`ran` / `skipped` / `stoppedAt`)。exit 0 = 全部 PASS。
+
 `preflight` 核的项(每项 pass / fail / unknown,**任一非 pass 整体 FAIL**,不许部分成功):alias 与 hub 名册里的 `node_id` 精确匹配;节点自己的 `CODEX_HOME` 0700、`auth.json` 0600、CommHub token 指纹一致;工作目录在 config、TUI 进程 cwd、TUI `-C`、Bridge 进程四处一致;`codexThreadId` 是完整 36 位且 `CODEX_HOME` 里恰有一个对应 rollout(记下绝对路径、inode、字节数、mtime;不接受前缀或「最近的文件」);app-server 端口的占用者确实是本节点的进程(否则视为 foreign PID,不会去动它);tmux 三段(app-server / TUI / bridge)都在跑且子进程都带本节点的身份 marker。
 
 receipt 写在 `.anet/nodes/<id>/receipts/<id>.json`(0600):凭据只记不可逆短指纹,token 不会出现在 receipt、日志或参数里。`verify` 在跨节点 nonce 探针落地前 `identity_attested` 恒为 unknown,因此恒 FAIL —— 这是有意的。start / restart / resume / fork / account / rollback 分批落地,合同见仓库 issue #1856。

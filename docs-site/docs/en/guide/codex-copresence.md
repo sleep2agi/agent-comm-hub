@@ -187,6 +187,14 @@ The login source is an **opaque reference** only, `codex-login:<profile-id>`: th
 
 `rollback` accepts only the `backup_ref` recorded in the original install receipt, never a caller-supplied file: restore → full restart → fingerprint back to the receipt's `targetPreviousFingerprint`.
 
+### Canary before any batch
+
+```bash
+anet node codex canary nodeA nodeB nodeC --probe-from <peer>     # verify one by one, stop at the first FAIL
+```
+
+Before restarting or re-logging a batch of co-presence nodes, run `canary`: the list is validated as a whole first (a typo or a non-codex node refuses the whole run before anything happens), then each node is **verified in order** (with nonce attestation when `--probe-from` is given); the first FAIL stops the run, the remaining nodes are never touched and are listed as "not run". Every node keeps its own verify receipt; `--json` prints the summary (`ran` / `skipped` / `stoppedAt`). Exit 0 means every node passed.
+
 What `preflight` checks (each pass / fail / unknown; **anything but pass fails the whole receipt** — no partial success): the alias maps exactly to the `node_id` the hub roster holds; the node's own `CODEX_HOME` is 0700, `auth.json` 0600, and the CommHub token fingerprint matches; the working directory agrees across the config, the TUI process cwd, the TUI `-C` argument and the Bridge process; `codexThreadId` is a full 36-character id with exactly one rollout in that `CODEX_HOME` (absolute path, inode, bytes and mtime are recorded; prefixes or "the newest file" are refused); the app-server port is held by this node's own process (anything else is a foreign PID and is never touched); all three tmux segments (app-server / TUI / bridge) are running and their child processes carry this node's identity marker.
 
 Receipts are written to `.anet/nodes/<id>/receipts/<id>.json` (0600): credentials appear only as irreversible short fingerprints, never in receipts, logs or arguments. Until the cross-node nonce probe lands, `verify` reports `identity_attested` as unknown and therefore always FAILs — by design. start / restart / resume / fork / account / rollback follow in batches; the contract lives in repository issue #1856.
