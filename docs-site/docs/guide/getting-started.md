@@ -6,7 +6,7 @@
      每一处需要改的行。改了正文也要改戳,反之亦然 —— 两边不一致时门同样会红。
      只标"现状"断言;讲历史的版本引用(如 `≤ 2.3.0-preview.37`)故意不标。 -->
 <!-- version-claim: package=agent-network channel=latest version=2.3.0-preview.76 -->
-<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.88 -->
+<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.89 -->
 
 新用户首次跑通的最小路径——**5 步, 5 分钟**。每步一条命令 + 一句验证。
 
@@ -100,7 +100,7 @@ anet hub dashboard
 | `2.3.0-preview.47`(当时的 `latest`) | `anet-3ce2750defe04d9ab3baf0` —— **随机串**,并提示首次登录后要改 |
 | `2.3.0-preview.49`(当时的 `preview`) | `anet-7fe4eddb08f648dcbd7fcd` —— **随机串**,同上 |
 | `2.3.0-preview.76`(当前 `latest`) | 同为**随机串** —— 未逐版本重测:生成密码的 `server/src/auth.ts` 自 `.49` 发布(2026-08-27T02:25Z)起**零提交**,逻辑逐字未变 |
-| `2.3.0-preview.88`(当前 `preview`) | 同为**随机串** —— 未逐版本重测:生成密码的 `server/src/auth.ts` 自 `.49` 发布(2026-08-27T02:25Z)起**零提交**,逻辑逐字未变 |
+| `2.3.0-preview.89`(当前 `preview`) | 同为**随机串** —— 未逐版本重测:生成密码的 `server/src/auth.ts` 自 `.49` 发布(2026-08-27T02:25Z)起**零提交**,逻辑逐字未变 |
 
 两次都没有出现字面量 `anethub`。
 
