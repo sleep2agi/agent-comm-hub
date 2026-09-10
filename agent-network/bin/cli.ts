@@ -38,6 +38,7 @@ import {
 import { buildReceipt, formatReceiptSummary, writeReceipt, type LifecycleVerb, type ReceiptCheck } from "../src/codex-lifecycle-receipt";
 import { evaluateCodexPreflight, evaluateCodexVerify, checkIdentity, checkHome, checkSession } from "../src/codex-lifecycle-preflight";
 import { FORK_HOME_COPY, checkForkIsolation, forkRolloutPath, rewriteRollout, uuidV7 } from "../src/codex-lifecycle-fork";
+import { formatCanarySummary, runCanary } from "../src/codex-lifecycle-canary";
 import { accountFingerprint, backupPathFor, backupRefFor, classifyProbe, credentialRefFor, hostIdOf, parseSourceRef, readRegistry, resolveProfile, runAccountInstall, runRollback, writeRegistry, type ProbeStatus, type RegistryEntry } from "../src/codex-lifecycle-account";
 import { gatherCodexFacts, realPrimitives, findRollouts, processFact, goalsFileState } from "../src/codex-lifecycle-facts";
 import { runCodexRestart, type RestartActions, type GoalState as LifecycleGoalState } from "../src/codex-lifecycle-restart";
@@ -3900,7 +3901,7 @@ Node Management:
   anet node restart <name>      Stop then start a node
   anet node loop <name> ...     Schedule a recurring goal on a node
   anet node ls                  List all nodes
-  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|start|restart|resume|fork|account|rollback
+  anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|canary|start|restart|resume|fork|account|rollback
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -7655,7 +7656,7 @@ async function codexLifecycleCommand() {
   const ref = args[2];
   const opts = parseOpts();
   const usage = () => {
-    console.error("Usage: anet node codex <preflight|verify|start|restart|resume|fork|account|rollback> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
+    console.error("Usage: anet node codex <preflight|verify|canary|start|restart|resume|fork|account|rollback> <alias> [--json] [--probe-from <peer>] [--thread <id>]");
     console.error("  preflight  只读核对:alias↔node_id、CODEX_HOME/auth、工作目录四处一致、exact thread + 唯一 rollout、端口归属、tmux 拓扑");
     console.error("  verify     preflight + 子进程环境核对(CODEX_HOME / token 短指纹)+ 跨节点身份验收(PR-B 前恒为 unknown → FAIL)");
     console.error("  exit 0 = PASS;exit 2 = FAIL(receipt 里列 blocking);receipt 落在 .anet/nodes/<id>/receipts/,凭据只记短指纹");
@@ -7667,9 +7668,11 @@ async function codexLifecycleCommand() {
     console.error("  account    register <profile-id> --from-codex-home <dir> | list | install <alias> --source codex-login:<profile-id> [--probe-from <peer>]");
     console.error("             登录源是本机受控 registry 的不透明引用(不收路径/stdin/env);install = fresh 模型探针 → 备份 → 0600 安装 → 完整重启 → verify;失败自动回滚");
     console.error("  rollback   rollback <alias> --receipt <id> [--probe-from <peer>]:只认原 install receipt 里的 backup_ref");
+    console.error("  canary     canary <alias>... [--probe-from <peer>]:逐个 verify,第一个 FAIL 即停(后面的不碰);批量重启/换号前先跑它");
   };
-  const landed = ["preflight", "verify", "start", "restart", "resume", "fork", "account", "rollback"];
+  const landed = ["preflight", "verify", "canary", "start", "restart", "resume", "fork", "account", "rollback"];
   if (!verb || !ref || !landed.includes(verb)) { usage(); process.exit(verb ? 2 : 0); }
+  if (verb === "canary") { await codexCanaryCommand(positionalArgs(args.slice(2)), opts); return; }
   if (verb === "fork") { await codexForkCommand(ref, opts); return; }
   if (verb === "account") { await codexAccountCommand(ref, args[3], opts); return; }
   if (verb === "rollback") { await codexRollbackCommand(ref, opts); return; }
@@ -8023,6 +8026,36 @@ async function codexRollbackCommand(alias: string, opts: Record<string, string>)
   if (json) console.log(JSON.stringify({ ...receipt, rolledBackFrom: receiptId, backupRef: outcome.backupRef, stoppedAt: outcome.stoppedAt, receiptPath: path }, null, 2));
   else { console.log(formatReceiptSummary(receipt)); console.log(`stopped at: ${outcome.stoppedAt}`); console.log(`receipt: ${path}`); }
   process.exit(receipt.verdict === "PASS" ? 0 : 2);
+}
+
+// ── #1856 PR-E —— anet node codex canary <alias>...:顺序 verify,第一个 FAIL 即停 ──
+async function codexCanaryCommand(aliases: string[], opts: Record<string, string>) {
+  const json = opts.json === "true";
+  if (aliases.length === 0) { console.error("Usage: anet node codex canary <alias>... [--probe-from <peer>] [--probe-root <dir>] [--json]"); process.exit(2); }
+  // 先把名单核完再动手:一个名字打错不该让前面的节点白跑一半。
+  const unknown = aliases.filter((a) => !resolveNodeRef(a));
+  if (unknown.length > 0) { console.error(`[anet] node codex canary: unknown node(s): ${unknown.join(", ")} (anet node ls)`); process.exit(2); }
+  const notCodex = aliases.filter((a) => normalizeRuntime(resolveNodeRef(a)!.profile) !== "codex-app-server");
+  if (notCodex.length > 0) { console.error(`[anet] node codex canary: not codex-app-server: ${notCodex.join(", ")}`); process.exit(2); }
+  const peer = opts["probe-from"] ? resolveNodeRefAt(opts["probe-root"], String(opts["probe-from"])) : null;
+  if (opts["probe-from"] && !peer) { console.error(`[anet] node codex canary: --probe-from ${opts["probe-from"]}: unknown local node`); process.exit(2); }
+  const summary = await runCanary(aliases, async (alias) => {
+    const ctx = await codexLifecycleCtx("verify", alias, opts);
+    const usePeer = peer && peer.id !== ctx.resolved.id ? peer : null;
+    const actions = codexRestartActions({ ...ctx, verb: "verify" }, usePeer);
+    const facts = await ctx.gather();
+    const probe = usePeer && actions.nonceProbe ? await actions.nonceProbe() : null;
+    const attested = probe
+      ? { key: "identity_attested", status: probe.ok ? ("pass" as const) : ("fail" as const), detail: probe.detail, ...(probe.evidence ? { evidence: probe.evidence } : {}) }
+      : ctx.unattested;
+    const checks = evaluateCodexVerify(facts, attested);
+    const receipt = buildReceipt({ verb: "verify", alias: ctx.displayName, nodeId: ctx.profile.node_id ?? null, startedAt: ctx.startedAt, checks });
+    const path = writeReceipt(ctx.nodeDir, receipt);
+    if (!json) console.log(`[anet] canary ${alias}: ${receipt.verdict}${receipt.blocking.length ? ` (${receipt.blocking.join(", ")})` : ""}`);
+    return { verdict: receipt.verdict, blocking: receipt.blocking, receiptPath: path };
+  });
+  if (json) console.log(JSON.stringify(summary, null, 2)); else console.log(formatCanarySummary(summary));
+  process.exit(summary.verdict === "PASS" ? 0 : 2);
 }
 
 async function resumeCommand() {
